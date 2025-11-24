@@ -1,0 +1,344 @@
+# QREA Warehouse Configuration
+# Complete parameter set for Quantum-Resonant Evolutionary Agents
+
+# ============================================================================
+# ENVIRONMENT CONFIGURATION
+# ============================================================================
+environment:
+  name: "warehouse_3d"
+  grid_size: [50, 50]  # meters
+  num_robots: 8
+  num_packages: 100
+  num_stations: 4
+  
+  # Package generation
+  package_spawn_rate: 0.5  # packages per second
+  package_types:
+    standard: {weight: 5.0, priority: 1, reward: 100.0}  # 10 -> 100
+    express: {weight: 3.0, priority: 2, reward: 200.0}   # 25 -> 200
+    fragile: {weight: 2.0, priority: 3, reward: 300.0}   # 40 -> 300
+  
+  # Station configuration
+  stations:
+    pickup: [5, 5]
+    delivery_a: [45, 5]
+    delivery_b: [45, 45]
+    delivery_c: [5, 45]
+  
+  # Physics
+  dt: 0.1  # seconds
+  max_episode_steps: 5000
+  
+  # Robot physics
+  robot:
+    radius: 0.5  # meters
+    max_speed: 2.0  # m/s
+    max_acceleration: 1.0  # m/s^2
+    max_angular_velocity: 1.57  # rad/s (90 deg/s)
+    battery_capacity: 1000.0  # energy units
+    battery_drain_idle: 0.1  # per step
+    battery_drain_moving: 0.5  # per step
+    battery_drain_carrying: 1.0  # per step
+    charging_rate: 5.0  # per step at station
+  
+  # Sensors
+  sensors:
+    lidar:
+      num_rays: 32
+      max_range: 10.0  # meters
+      noise_std: 0.05
+    gps:
+      noise_std: 0.1
+    imu:
+      noise_std: 0.01
+    camera:
+      enabled: false  # Future: visual obs
+
+# ============================================================================
+# AGENT ARCHITECTURE
+# ============================================================================
+agent:
+  # World Model (RSSM - Recurrent State Space Model)
+  world_model:
+    latent_dim: 256
+    hidden_dim: 512
+    stochastic_dim: 32
+    deterministic_dim: 512
+    num_layers: 3
+    activation: "elu"
+    
+    # Components
+    encoder:
+      hidden_dims: [512, 512, 256]
+    decoder:
+      hidden_dims: [256, 512, 512]
+    reward_predictor:
+      hidden_dims: [512, 256]
+    discount_predictor:
+      hidden_dims: [512, 256]
+    
+  # Policy Network
+  policy:
+    hidden_dims: [512, 512, 256]
+    action_dim: 3  # [velocity, angular_velocity, gripper]
+    activation: "elu"
+    log_std_min: -10
+    log_std_max: 2
+    
+  # Value Network
+  value:
+    hidden_dims: [512, 512, 256]
+    activation: "elu"
+    
+  # Intrinsic Motivation
+  intrinsic:
+    # Novelty (RND - Random Network Distillation)
+    novelty:
+      enabled: true
+      weight: 0.1
+      network_dim: 512
+      predictor_lr: 0.0001
+      
+    # Competence (Learning Progress)
+    competence:
+      enabled: true
+      weight: 0.05
+      history_length: 100
+      
+    # Empowerment (Mutual Information)
+    empowerment:
+      enabled: true
+      weight: 0.05
+      planning_horizon: 5
+
+# ============================================================================
+# UPRT FIELD CONFIGURATION
+# ============================================================================
+uprt:
+  # Field parameters
+  field:
+    grid_resolution: [100, 100]  # field grid
+    update_rate: 10  # Hz
+    diffusion_coeff: 0.1
+    decay_rate: 0.05
+    
+  # Pattern symbols
+  symbols:
+    num_prototypes: 50
+    embedding_dim: 128
+    detection_threshold: 0.7
+    emergence_threshold: 0.85
+    
+  # Resonance computation
+  resonance:
+    kernel_type: "gaussian"
+    kernel_width: 2.0
+    coherence_threshold: 0.6
+    
+  # Field types
+  consciousness_field:
+    enabled: true
+    interaction_strength: 1.0
+  
+  genetic_field:
+    enabled: true
+    inheritance_rate: 0.1
+    
+  resonance_field:
+    enabled: true
+    coupling_strength: 0.5
+
+# ============================================================================
+# LEARNING CONFIGURATION
+# ============================================================================
+learning:
+  # Optimization
+  optimizer: "adam"
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  grad_clip: 10.0
+  
+  # World model training
+  world_model:
+    batch_size: 50
+    sequence_length: 50
+    free_nats: 3.0
+    kl_weight: 1.0
+    
+  # Actor-critic
+  actor_critic:
+    batch_size: 50
+    sequence_length: 15
+    discount: 0.99
+    lambda_gae: 0.95
+    entropy_weight: 0.001
+    
+  # Experience replay
+  replay:
+    capacity: 1000000
+    prioritized: true
+    alpha: 0.6
+    beta_start: 0.4
+    beta_end: 1.0
+    beta_anneal_steps: 100000
+    
+  # Imagination training
+  imagination:
+    horizon: 15
+    num_trajectories: 10
+
+# ============================================================================
+# EVOLUTION CONFIGURATION
+# ============================================================================
+evolution:
+  # Population
+  population_size: 20
+  elite_size: 4
+  
+  # Selection
+  selection:
+    method: "tournament"  # or "roulette", "rank"
+    tournament_size: 3
+    
+  # Genetic operations
+  crossover:
+    rate: 0.7
+    method: "uniform"  # policy parameter mixing
+    alpha: 0.5
+    
+  mutation:
+    rate: 0.2
+    std: 0.1
+    adaptive: true
+    
+  # Horizontal Gene Transfer (HGT)
+  hgt:
+    enabled: true
+    rate: 0.1
+    transfer_method: "best_practice"  # transfer successful strategies
+    
+  # Inheritance modes
+  inheritance:
+    darwinian_weight: 0.5  # random variation
+    baldwinian_weight: 0.3  # learned skills
+    lamarckian_weight: 0.2  # direct transfer
+    
+  # Generation management
+  generations: 100
+  evaluation_episodes: 5
+  parallel_eval: true
+
+# ============================================================================
+# COMMUNICATION / LANGUAGE
+# ============================================================================
+communication:
+  # Emergent language
+  language:
+    enabled: true
+    vocab_size: 100
+    message_length: 10
+    embedding_dim: 64
+    
+  # Communication channel
+  channel:
+    range: 15.0  # meters
+    bandwidth: 10  # messages per second
+    noise_level: 0.05
+    
+  # Pragmatic evolution
+  pragmatics:
+    success_threshold: 0.8
+    update_rate: 0.01
+
+# ============================================================================
+# SAFETY CONFIGURATION
+# ============================================================================
+safety:
+  # Collision avoidance
+  collision:
+    min_distance: 1.0  # meters
+    soft_constraint_weight: 100.0
+    hard_constraint: true
+    
+  # PatchGate (safe self-modification)
+  patchgate:
+    enabled: true
+    test_episodes: 10
+    safety_threshold: 0.9
+    rollback_on_failure: true
+    
+  # Constraint verification
+  constraints:
+    max_velocity: 2.5
+    min_battery_reserve: 100.0
+    safe_zone_required: true
+
+# ============================================================================
+# SIMULATION CONFIGURATION
+# ============================================================================
+simulation:
+  # Training
+  num_epochs: 1000
+  steps_per_epoch: 10000
+  eval_interval: 10
+  eval_episodes: 10
+  
+  # Checkpointing
+  checkpoint_interval: 50
+  save_replay_buffer: false
+  
+  # Logging
+  log_interval: 100
+  tensorboard: true
+  wandb: false
+  log_video: true
+  video_interval: 100
+  
+  # Device
+  device: "cuda"  # or "cpu"
+  num_workers: 4
+  seed: 42
+
+# ============================================================================
+# METRICS & EVALUATION
+# ============================================================================
+metrics:
+  primary:
+    - throughput  # packages/hour
+    - efficiency  # energy per package
+    - success_rate
+    - collision_rate
+    
+  secondary:
+    - waiting_time
+    - travel_distance
+    - battery_usage
+    - coordination_score
+    
+  emergent:
+    - symbol_diversity
+    - language_efficiency
+    - field_coherence
+    - collective_intelligence
+
+# ============================================================================
+# EXPERIMENT CONFIGURATION
+# ============================================================================
+experiment:
+  name: "qrea_warehouse_v1"
+  description: "QREA system for warehouse logistics"
+  tags: ["qrea", "warehouse", "multi-agent"]
+  
+  # Baselines to compare
+  baselines:
+    - "random"
+    - "greedy"
+    - "ppo"
+    - "maddpg"
+    
+  # Ablation studies
+  ablations:
+    - "no_intrinsic"
+    - "no_evolution"
+    - "no_communication"
+    - "no_uprt"

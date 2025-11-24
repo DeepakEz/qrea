@@ -1,0 +1,362 @@
+# Enhanced QREA Configuration - Compatible Version
+# Integrates 7 advanced features with original config structure
+
+# ============================================================================
+# ENVIRONMENT CONFIGURATION
+# ============================================================================
+environment:
+  name: "warehouse_3d"
+  grid_size: [50, 50]
+  num_robots: 5  # Reduced for initial testing
+  num_packages: 100
+  num_stations: 4
+  
+  package_spawn_rate: 0.5
+  package_types:
+    standard: {weight: 5.0, priority: 1, reward: 100.0}  # 10x increase
+    express: {weight: 3.0, priority: 2, reward: 200.0}   # 8x increase
+    fragile: {weight: 2.0, priority: 3, reward: 300.0}   # 7.5x increase
+  
+  stations:
+    pickup: [5, 5]
+    delivery_a: [45, 5]
+    delivery_b: [45, 45]
+    delivery_c: [5, 45]
+  
+  dt: 0.1
+  max_episode_steps: 5000
+  
+  robot:
+    radius: 0.5
+    max_speed: 2.0
+    max_acceleration: 1.0
+    max_angular_velocity: 1.57
+    battery_capacity: 1000.0
+    battery_drain_idle: 0.1
+    battery_drain_moving: 0.5
+    battery_drain_carrying: 1.0
+    charging_rate: 5.0
+  
+  sensors:
+    lidar:
+      num_rays: 32
+      max_range: 10.0
+      noise_std: 0.05
+    gps:
+      noise_std: 0.1
+    imu:
+      noise_std: 0.01
+
+# ============================================================================
+# AGENT ARCHITECTURE
+# ============================================================================
+agent:
+  world_model:
+    latent_dim: 256
+    hidden_dim: 512
+    stochastic_dim: 32
+    deterministic_dim: 512
+    num_layers: 3
+    activation: "elu"
+    
+    encoder:
+      hidden_dims: [512, 512, 256]
+    decoder:
+      hidden_dims: [256, 512, 512]
+    reward_predictor:
+      hidden_dims: [512, 256]
+    discount_predictor:
+      hidden_dims: [512, 256]
+    
+  policy:
+    hidden_dims: [512, 512, 256]
+    action_dim: 3
+    activation: "elu"
+    log_std_min: -10
+    log_std_max: 2
+    
+  value:
+    hidden_dims: [512, 512, 256]
+    activation: "elu"
+    
+  # ✨ Feature 2: InfoNCE Empowerment
+  intrinsic:
+    novelty:
+      enabled: true
+      weight: 0.1
+      network_dim: 512
+      predictor_lr: 0.0001
+      
+    competence:
+      enabled: true
+      weight: 0.05
+      history_length: 100
+      
+    empowerment:
+      enabled: true
+      weight: 0.05
+      planning_horizon: 5
+      # Enhanced empowerment settings
+      use_infonce: true
+      num_negatives: 16
+      temperature: 0.1
+      lookahead_horizon: 3
+
+# ============================================================================
+# UPRT FIELD CONFIGURATION
+# ============================================================================
+uprt:
+  field:
+    grid_resolution: [100, 100]
+    update_rate: 10
+    diffusion_coeff: 0.1
+    decay_rate: 0.05
+    
+  symbols:
+    num_prototypes: 50
+    embedding_dim: 128
+    detection_threshold: 0.7
+    emergence_threshold: 0.85
+    
+  resonance:
+    kernel_type: "gaussian"
+    kernel_width: 2.0
+    coherence_threshold: 0.6
+    
+  consciousness_field:
+    enabled: true
+    interaction_strength: 1.0
+  
+  genetic_field:
+    enabled: true
+    inheritance_rate: 0.1
+    
+  resonance_field:
+    enabled: true
+    coupling_strength: 0.5
+  
+  # ✨ Feature 4: Advanced UPRT Solver
+  solver:
+    method: "semi_implicit"  # or "explicit", "fft"
+    use_fft: true
+    fft_threshold: 64  # Use FFT for grids >= 64x64
+    cfl_safety: 0.8
+    implicit_solver: "conjugate_gradient"
+
+# ============================================================================
+# LEARNING CONFIGURATION
+# ============================================================================
+learning:
+  optimizer: "adam"
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  grad_clip: 10.0
+  
+  # ✨ Feature 1: Mixed-Precision Training
+  amp: true  # Automatic Mixed Precision
+  amp_dtype: "float16"
+  
+  # ✨ Feature 1: Ensemble Disagreement
+  ensemble_world_models: 3
+  ensemble_voting: "variance"
+  
+  world_model:
+    batch_size: 50
+    sequence_length: 50
+    free_nats: 3.0
+    kl_weight: 1.0
+    
+  actor_critic:
+    batch_size: 50
+    sequence_length: 15
+    discount: 0.99
+    lambda_gae: 0.95
+    entropy_weight: 0.001
+    
+  replay:
+    capacity: 1000000
+    prioritized: true
+    alpha: 0.6
+    beta_start: 0.4
+    beta_end: 1.0
+    beta_anneal_steps: 100000
+    
+  imagination:
+    horizon: 15
+    num_trajectories: 10
+
+# ============================================================================
+# EVOLUTION CONFIGURATION  
+# ============================================================================
+evolution:
+  population_size: 20
+  elite_size: 4
+  
+  selection:
+    method: "tournament"
+    tournament_size: 3
+    
+  crossover:
+    rate: 0.7
+    method: "uniform"
+    alpha: 0.5
+    
+  mutation:
+    rate: 0.2
+    std: 0.1
+    adaptive: true
+    
+  # ✨ Feature 3: Self-Adaptive Evolution
+  cma_es:
+    enabled: true
+    sigma: 0.3
+    popsize: 20
+    mu: 10  # Parents
+    lambda_: 20  # Offspring
+    
+  heritability:
+    track: true
+    window: 10
+    min_heritability: 0.2
+    
+  hgt:
+    enabled: true
+    rate: 0.1
+    transfer_method: "best_practice"
+    
+  inheritance:
+    darwinian_weight: 0.5
+    baldwinian_weight: 0.3
+    lamarckian_weight: 0.2
+    
+  generations: 100
+  evaluation_episodes: 5
+  parallel_eval: true
+
+# ============================================================================
+# COMMUNICATION / LANGUAGE
+# ============================================================================
+communication:
+  language:
+    enabled: true
+    vocab_size: 100
+    message_length: 10
+    embedding_dim: 64
+    
+  channel:
+    range: 15.0
+    bandwidth: 10
+    noise_level: 0.05
+    
+  pragmatics:
+    success_threshold: 0.8
+    update_rate: 0.01
+
+# ============================================================================
+# SAFETY CONFIGURATION
+# ============================================================================
+safety:
+  collision:
+    min_distance: 1.0
+    soft_constraint_weight: 100.0
+    hard_constraint: true
+    
+  # ✨ Feature 5: Barrier Lyapunov + PatchGate
+  barrier_lyapunov:
+    enabled: true
+    barrier_gain: 10.0
+    max_barrier_value: 1000.0
+    
+  patchgate:
+    enabled: true
+    test_episodes: 10
+    safety_threshold: 0.9
+    rollback_on_failure: true
+    formal_verification: true
+    verification_method: "bounded_model_checking"
+    
+  constraints:
+    max_velocity: 2.5
+    min_battery_reserve: 100.0
+    safe_zone_required: true
+
+# ============================================================================
+# SIMULATION CONFIGURATION (REQUIRED!)
+# ============================================================================
+simulation:
+  # Training
+  num_epochs: 1000
+  steps_per_epoch: 10000
+  eval_interval: 10
+  eval_episodes: 10
+  
+  # Checkpointing
+  checkpoint_interval: 50
+  save_replay_buffer: false
+  
+  # Logging
+  log_interval: 100
+  tensorboard: true
+  wandb: false
+  log_video: true
+  video_interval: 100
+  
+  # Device (REQUIRED!)
+  device: "cuda"
+  num_workers: 4
+  seed: 42
+
+# ============================================================================
+# METRICS & EVALUATION
+# ============================================================================
+metrics:
+  primary:
+    - throughput
+    - efficiency
+    - success_rate
+    - collision_rate
+    
+  secondary:
+    - waiting_time
+    - travel_distance
+    - battery_usage
+    - coordination_score
+    
+  emergent:
+    - symbol_diversity
+    - language_efficiency
+    - field_coherence
+    - collective_intelligence
+
+# ============================================================================
+# EXPERIMENT CONFIGURATION
+# ============================================================================
+experiment:
+  name: "qrea_warehouse_enhanced"
+  description: "QREA with 7 advanced research features"
+  tags: ["qrea", "warehouse", "enhanced", "research"]
+  
+  baselines:
+    - "random"
+    - "greedy"
+    - "ppo"
+    - "maddpg"
+    
+  ablations:
+    - "no_intrinsic"
+    - "no_evolution"
+    - "no_communication"
+    - "no_uprt"
+    - "no_amp"
+    - "no_ensemble"
+
+# ============================================================================
+# ✨ ENHANCEMENT FEATURES SUMMARY
+# ============================================================================
+# Feature 1: AMP + Ensemble Disagreement (learning.amp, learning.ensemble_world_models)
+# Feature 2: InfoNCE Empowerment (agent.intrinsic.empowerment.use_infonce)
+# Feature 3: Self-Adaptive Evolution (evolution.cma_es, evolution.heritability)
+# Feature 4: Advanced UPRT Solver (uprt.solver)
+# Feature 5: Barrier Lyapunov + PatchGate (safety.barrier_lyapunov, safety.patchgate)
+# Feature 6: CTDE (to be implemented in multi-agent code)
+# Feature 7: Best Practices (type hints, logging, unit tests)
