@@ -19,12 +19,24 @@ from dataclasses import dataclass, field
 from collections import deque
 import copy
 
-from mera_enhanced import (
-    EnhancedMERAConfig,
-    EnhancedTensorNetworkMERA,
-    MERAWorldModelEncoder,
-    PhiQComputer
-)
+try:
+    from mera_enhanced import (
+        EnhancedMERAConfig,
+        EnhancedTensorNetworkMERA,
+        MERAWorldModelEncoder,
+        PhiQComputer
+    )
+except ImportError:
+    # Handle case where running from different directory
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    from mera_enhanced import (
+        EnhancedMERAConfig,
+        EnhancedTensorNetworkMERA,
+        MERAWorldModelEncoder,
+        PhiQComputer
+    )
 
 
 @dataclass

@@ -33,7 +33,7 @@ class EnhancedMERAConfig:
     # Architecture
     num_layers: int = 3
     bond_dim: int = 8
-    physical_dim: int = 4
+    physical_dim: int = 8  # Should match bond_dim for consistent flow
     temporal_window: int = 50
 
     # Physics-inspired constraints
@@ -65,17 +65,18 @@ class UnitaryInitializer:
         Initialize tensor to be approximately unitary.
         Uses QR decomposition for proper orthogonal initialization.
         """
-        if len(shape) == 4:  # Disentangler: (d, d, d, d)
-            d = shape[0]
-            # Reshape to (d*d, d*d) matrix
-            flat_shape = (d * d, d * d)
+        if len(shape) == 4:  # Disentangler: (d_in, d_in, d_out, d_out)
+            d_in = shape[0]
+            d_out = shape[2]
+            # Reshape to (d_in*d_in, d_out*d_out) matrix
+            flat_shape = (d_in * d_in, d_out * d_out)
             flat = torch.randn(flat_shape)
-            # QR decomposition for orthogonal matrix
-            q, r = torch.linalg.qr(flat)
-            # Ensure determinant is positive (proper rotation)
-            d_sign = torch.diag(torch.sign(torch.diag(r)))
-            q = q @ d_sign
-            return (gain * q).reshape(shape)
+            # Use SVD for proper initialization
+            u, s, vh = torch.linalg.svd(flat, full_matrices=False)
+            # Reconstruct with normalized singular values
+            k = min(flat_shape)
+            result = u[:, :k] @ vh[:k, :]
+            return (gain * result).reshape(shape)
 
         elif len(shape) == 3:  # Isometry: (χ, d, d)
             chi, d1, d2 = shape
@@ -84,8 +85,11 @@ class UnitaryInitializer:
             flat = torch.randn(flat_shape)
             # SVD for isometry: V†V = I
             u, s, vh = torch.linalg.svd(flat, full_matrices=False)
-            # Use V† as isometry
-            return (gain * vh).reshape(shape)
+            # Use appropriate matrix based on dimensions
+            if chi <= d1 * d2:
+                return (gain * u).reshape(chi, d1, d2)
+            else:
+                return (gain * vh[:chi, :]).reshape(chi, d1, d2)
 
         else:
             return torch.randn(shape) * gain * 0.1
@@ -95,28 +99,24 @@ class UnitaryInitializer:
                                    target: str = 'unitary') -> torch.Tensor:
         """
         Compute regularization loss for unitary/isometry constraint.
-
-        Args:
-            tensor: The tensor to regularize
-            target: 'unitary' for U†U = I, 'isometry' for V†V = I
-
-        Returns:
-            Regularization loss (scalar)
         """
         if len(tensor.shape) == 4:  # Disentangler
-            d = tensor.shape[0]
+            d_in, _, d_out, _ = tensor.shape
             # Reshape to matrix
-            mat = tensor.reshape(d * d, d * d)
-            # U†U should be identity
-            product = mat.T @ mat
-            identity = torch.eye(d * d, device=tensor.device)
-            return F.mse_loss(product, identity)
+            mat = tensor.reshape(d_in * d_in, d_out * d_out)
+            # For non-square, compute both products
+            if d_in == d_out:
+                product = mat.T @ mat
+                identity = torch.eye(d_out * d_out, device=tensor.device)
+                return F.mse_loss(product, identity)
+            else:
+                # Just ensure bounded singular values
+                _, s, _ = torch.linalg.svd(mat)
+                return F.mse_loss(s, torch.ones_like(s))
 
         elif len(tensor.shape) == 3:  # Isometry
             chi, d1, d2 = tensor.shape
-            # Reshape to (χ, d*d)
             mat = tensor.reshape(chi, d1 * d2)
-            # V†V should be identity (on smaller dimension)
             if chi <= d1 * d2:
                 product = mat @ mat.T
                 identity = torch.eye(chi, device=tensor.device)
@@ -130,104 +130,119 @@ class UnitaryInitializer:
 
 class EnhancedDisentangler(nn.Module):
     """
-    Enhanced disentangler with proper SVD-based output decomposition.
+    Enhanced disentangler using MLP for flexibility with varying dimensions.
 
-    Improvements over base:
-    1. Unitary initialization
-    2. Proper SVD-based site splitting
-    3. Optional dropout for regularization
+    This approach is more flexible than pure tensor contractions and allows
+    handling of dimension changes across layers.
     """
 
-    def __init__(self, physical_dim: int, bond_dim: int, dropout: float = 0.0):
+    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.0):
         super().__init__()
-        self.physical_dim = physical_dim
-        self.bond_dim = bond_dim
+        self.input_dim = input_dim
+        self.output_dim = output_dim
 
-        # Initialize with approximate unitary structure
-        init_tensor = UnitaryInitializer.unitary_init(
-            (physical_dim, physical_dim, physical_dim, physical_dim),
-            gain=1.0
+        # MLP-based disentangler for flexibility
+        hidden_dim = max(input_dim, output_dim) * 2
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim * 2),
         )
-        self.tensor = nn.Parameter(init_tensor)
 
-        # Learnable split weights for SVD-like decomposition
-        self.split_weight_left = nn.Parameter(torch.ones(physical_dim) / math.sqrt(physical_dim))
-        self.split_weight_right = nn.Parameter(torch.ones(physical_dim) / math.sqrt(physical_dim))
-
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        # Learnable mixing weights
+        self.alpha = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, site1: torch.Tensor, site2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply disentangler with proper decomposition.
+        Apply disentangler to two adjacent sites.
 
         Args:
-            site1: (batch, physical_dim)
-            site2: (batch, physical_dim)
+            site1: (batch, input_dim)
+            site2: (batch, input_dim)
 
         Returns:
-            Tuple of disentangled sites
+            Tuple of disentangled sites (batch, output_dim) each
         """
-        # Contract: u_{ijkl} × s1_i × s2_j → combined_{kl}
-        combined = torch.einsum('ijkl,bi,bj->bkl', self.tensor, site1, site2)
+        # Concatenate sites
+        combined = torch.cat([site1, site2], dim=-1)  # (batch, input_dim * 2)
 
-        # SVD-inspired split using learned weights
-        # This is more principled than simple mean
-        out1 = torch.einsum('bkl,l->bk', combined, F.softmax(self.split_weight_right, dim=0))
-        out2 = torch.einsum('bkl,k->bl', combined, F.softmax(self.split_weight_left, dim=0))
+        # Transform
+        output = self.net(combined)  # (batch, output_dim * 2)
 
-        # Normalize to maintain quantum-like structure
-        out1 = F.normalize(out1, dim=-1)
-        out2 = F.normalize(out2, dim=-1)
+        # Split into two sites
+        out1, out2 = torch.chunk(output, 2, dim=-1)
 
-        return self.dropout(out1), self.dropout(out2)
+        # Normalize to maintain scale
+        out1 = F.normalize(out1, dim=-1) * math.sqrt(self.output_dim)
+        out2 = F.normalize(out2, dim=-1) * math.sqrt(self.output_dim)
+
+        return out1, out2
 
     def unitarity_loss(self) -> torch.Tensor:
-        """Compute unitarity constraint loss"""
-        return UnitaryInitializer.orthogonal_regularization(self.tensor, 'unitary')
+        """Compute approximate unitarity loss via weight orthogonality"""
+        loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        for module in self.net:
+            if isinstance(module, nn.Linear):
+                W = module.weight
+                if W.shape[0] == W.shape[1]:
+                    WtW = W @ W.T
+                    I = torch.eye(W.shape[0], device=W.device)
+                    loss = loss + F.mse_loss(WtW, I) * 0.01
+        return loss
 
 
 class EnhancedIsometry(nn.Module):
     """
-    Enhanced isometry with proper constraint enforcement.
+    Enhanced isometry using MLP for dimension reduction.
 
-    Improvements:
-    1. Isometry initialization (V†V = I)
-    2. Regularization loss for constraint
-    3. Optional layer normalization
+    Coarse-grains two sites into one while maintaining information.
     """
 
-    def __init__(self, physical_dim: int, bond_dim: int, use_layernorm: bool = True):
+    def __init__(self, input_dim: int, output_dim: int, use_layernorm: bool = True):
         super().__init__()
-        self.physical_dim = physical_dim
-        self.bond_dim = bond_dim
+        self.input_dim = input_dim
+        self.output_dim = output_dim
 
-        # Initialize as isometry
-        init_tensor = UnitaryInitializer.unitary_init(
-            (bond_dim, physical_dim, physical_dim),
-            gain=1.0
+        hidden_dim = max(input_dim, output_dim) * 2
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),
         )
-        self.tensor = nn.Parameter(init_tensor)
 
-        # Optional layer normalization
-        self.layernorm = nn.LayerNorm(bond_dim) if use_layernorm else nn.Identity()
+        self.layernorm = nn.LayerNorm(output_dim) if use_layernorm else nn.Identity()
 
     def forward(self, site1: torch.Tensor, site2: torch.Tensor) -> torch.Tensor:
         """
         Apply isometry to coarse-grain two sites.
 
         Args:
-            site1, site2: (batch, physical_dim)
+            site1, site2: (batch, input_dim)
 
         Returns:
-            (batch, bond_dim) coarse-grained site
+            (batch, output_dim) coarse-grained site
         """
-        # Contract: w_{α,i,j} × s1_i × s2_j → out_α
-        output = torch.einsum('aij,bi,bj->ba', self.tensor, site1, site2)
+        combined = torch.cat([site1, site2], dim=-1)
+        output = self.net(combined)
         return self.layernorm(output)
 
     def isometry_loss(self) -> torch.Tensor:
-        """Compute isometry constraint loss: w†w = I"""
-        return UnitaryInitializer.orthogonal_regularization(self.tensor, 'isometry')
+        """Compute isometry constraint loss"""
+        loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        for module in self.net:
+            if isinstance(module, nn.Linear):
+                W = module.weight
+                # Encourage orthogonal rows (for dimension reduction)
+                if W.shape[0] < W.shape[1]:
+                    WWt = W @ W.T
+                    I = torch.eye(W.shape[0], device=W.device)
+                    loss = loss + F.mse_loss(WWt, I) * 0.01
+        return loss
 
 
 class PhiQComputer(nn.Module):
@@ -236,27 +251,16 @@ class PhiQComputer(nn.Module):
 
     Φ_Q measures how much information the system has that cannot
     be reduced to independent parts - a measure of "integration".
-
-    In RL context: High Φ_Q states may represent decision points
-    or skill boundaries worth exploring.
     """
 
-    def __init__(self, min_sites: int = 2, use_exact_svd: bool = True):
+    def __init__(self, min_sites: int = 2):
         super().__init__()
         self.min_sites = min_sites
-        self.use_exact_svd = use_exact_svd
 
     def compute_entanglement_entropy(self, sites: List[torch.Tensor],
                                       partition_idx: int) -> torch.Tensor:
         """
         Compute entanglement entropy S_A via SVD of correlation matrix.
-
-        Args:
-            sites: List of (batch, dim) tensors
-            partition_idx: Where to bipartition
-
-        Returns:
-            (batch,) entropy values
         """
         if partition_idx <= 0 or partition_idx >= len(sites):
             return torch.zeros(sites[0].shape[0], device=sites[0].device)
@@ -269,55 +273,24 @@ class PhiQComputer(nn.Module):
         corr = torch.einsum('bik,bjk->bij', sites_A, sites_B)  # (B, n_A, n_B)
 
         # SVD for Schmidt coefficients
-        if self.use_exact_svd:
-            try:
-                _, s, _ = torch.linalg.svd(corr)
-            except RuntimeError:
-                # Fallback for numerical issues
-                s = torch.ones(corr.shape[0], min(corr.shape[1], corr.shape[2]),
-                              device=corr.device)
-        else:
-            # Approximate via power iteration (faster but less accurate)
-            s = self._power_iteration_singular_values(corr, k=min(5, min(corr.shape[1:])))
+        try:
+            _, s, _ = torch.linalg.svd(corr)
+        except RuntimeError:
+            s = torch.ones(corr.shape[0], min(corr.shape[1], corr.shape[2]),
+                          device=corr.device)
 
         # Normalize to probability distribution
-        s_sq = s ** 2
-        s_normalized = s_sq / (s_sq.sum(dim=-1, keepdim=True) + 1e-8)
+        s_sq = s ** 2 + 1e-10
+        s_normalized = s_sq / s_sq.sum(dim=-1, keepdim=True)
 
         # Von Neumann entropy: S = -Σ p log p
         entropy = -torch.sum(s_normalized * torch.log(s_normalized + 1e-10), dim=-1)
 
         return entropy
 
-    def _power_iteration_singular_values(self, A: torch.Tensor, k: int = 5,
-                                          num_iters: int = 10) -> torch.Tensor:
-        """Fast approximate SVD via power iteration"""
-        B, m, n = A.shape
-        device = A.device
-
-        # Initialize random vectors
-        v = torch.randn(B, n, k, device=device)
-        v = F.normalize(v, dim=1)
-
-        for _ in range(num_iters):
-            u = torch.bmm(A, v)
-            u = F.normalize(u, dim=1)
-            v = torch.bmm(A.transpose(1, 2), u)
-            v = F.normalize(v, dim=1)
-
-        # Singular values
-        Av = torch.bmm(A, v)
-        s = torch.norm(Av, dim=1)  # (B, k)
-
-        return s
-
     def forward(self, sites: List[torch.Tensor]) -> torch.Tensor:
         """
         Compute Φ_Q (integrated information).
-
-        Φ_Q = S(A:B|whole) - [S(A|A_parts) + S(B|B_parts)]
-
-        This is positive when the whole has more integration than the sum of parts.
         """
         if len(sites) < self.min_sites:
             return torch.zeros(sites[0].shape[0], device=sites[0].device)
@@ -327,7 +300,7 @@ class PhiQComputer(nn.Module):
         # Entropy of whole system at bipartition
         S_whole = self.compute_entanglement_entropy(sites, mid)
 
-        # Entropy of parts (recursive bipartition)
+        # Entropy of parts
         left_sites = sites[:mid]
         right_sites = sites[mid:]
 
@@ -339,18 +312,12 @@ class PhiQComputer(nn.Module):
         # Φ_Q: integration beyond sum of parts
         phi_q = S_whole - (S_left + S_right)
 
-        # Φ_Q is non-negative by definition
         return F.relu(phi_q)
 
 
 class MERAIntrinsicMotivation(nn.Module):
     """
     Intrinsic motivation signals derived from MERA structure.
-
-    Provides three novel intrinsic rewards:
-    1. Φ_Q reward: Explore states with high integrated information
-    2. Entanglement reward: Explore states with interesting temporal structure
-    3. RG novelty: Explore states with unusual scale properties
     """
 
     def __init__(self, config: EnhancedMERAConfig):
@@ -366,7 +333,7 @@ class MERAIntrinsicMotivation(nn.Module):
         self.register_buffer('update_count', torch.tensor(0))
 
     def update_statistics(self, phi_q: torch.Tensor, entanglement: torch.Tensor):
-        """Update running statistics with exponential moving average"""
+        """Update running statistics"""
         momentum = 0.99
         count = self.update_count.item()
 
@@ -385,36 +352,20 @@ class MERAIntrinsicMotivation(nn.Module):
 
     def compute_intrinsic_reward(self, layer_states: List[List[torch.Tensor]],
                                   rg_eigenvalues: List[float]) -> Dict[str, torch.Tensor]:
-        """
-        Compute all intrinsic motivation signals.
-
-        Args:
-            layer_states: States at each MERA layer
-            rg_eigenvalues: RG flow eigenvalues
-
-        Returns:
-            Dictionary with:
-                - phi_q_reward: Integrated information reward
-                - entanglement_reward: Temporal entanglement reward
-                - rg_novelty_reward: Scale novelty reward
-                - total_intrinsic: Weighted sum
-        """
+        """Compute all intrinsic motivation signals."""
         device = layer_states[0][0].device
         batch_size = layer_states[0][0].shape[0]
 
-        # 1. Φ_Q reward (explore integrated states)
+        # 1. Φ_Q reward
         phi_q_values = []
         for layer_idx in self.config.phi_q_layers:
-            if layer_idx < len(layer_states):
+            if layer_idx < len(layer_states) and len(layer_states[layer_idx]) >= 2:
                 phi_q = self.phi_q_computer(layer_states[layer_idx])
                 phi_q_values.append(phi_q)
 
-        if phi_q_values:
-            phi_q_total = torch.stack(phi_q_values).mean(dim=0)
-        else:
-            phi_q_total = torch.zeros(batch_size, device=device)
+        phi_q_total = torch.stack(phi_q_values).mean(dim=0) if phi_q_values else torch.zeros(batch_size, device=device)
 
-        # 2. Entanglement reward (explore temporally interesting states)
+        # 2. Entanglement reward
         if len(layer_states[0]) > 1:
             entanglement = self.phi_q_computer.compute_entanglement_entropy(
                 layer_states[0], len(layer_states[0]) // 2
@@ -422,23 +373,21 @@ class MERAIntrinsicMotivation(nn.Module):
         else:
             entanglement = torch.zeros(batch_size, device=device)
 
-        # 3. RG novelty (explore states with unusual scale properties)
+        # 3. RG novelty
         if rg_eigenvalues:
-            # High novelty when eigenvalues deviate from 1 (fixed points)
             rg_deviation = sum(abs(ev - 1.0) for ev in rg_eigenvalues) / len(rg_eigenvalues)
             rg_novelty = torch.full((batch_size,), rg_deviation, device=device)
         else:
             rg_novelty = torch.zeros(batch_size, device=device)
 
-        # Update running statistics
+        # Update statistics
         if self.training:
             self.update_statistics(phi_q_total.detach(), entanglement.detach())
 
-        # Normalize rewards
+        # Normalize
         phi_q_normalized = (phi_q_total - self.phi_q_mean) / (self.phi_q_std + 1e-8)
         entanglement_normalized = (entanglement - self.entanglement_mean) / (self.entanglement_std + 1e-8)
 
-        # Compute weighted total
         total_intrinsic = (
             self.config.phi_q_intrinsic_weight * phi_q_normalized +
             self.config.entanglement_exploration_weight * entanglement_normalized
@@ -458,56 +407,54 @@ class EnhancedTensorNetworkMERA(nn.Module):
     """
     Research-grade MERA implementation for reinforcement learning.
 
-    Key features:
-    1. Proper unitary/isometry initialization and constraints
-    2. Integrated information (Φ_Q) computation
-    3. Intrinsic motivation signals
-    4. Scale consistency loss
-    5. RG flow tracking
-    6. Efficient batched operations
+    Uses MLP-based disentanglers and isometries for flexibility with
+    varying input dimensions while maintaining the MERA structure.
     """
 
     def __init__(self, config: EnhancedMERAConfig):
         super().__init__()
         self.config = config
 
-        # Enhanced tensor components
+        # Ensure consistent dimensions
+        dim = config.bond_dim
+
+        # Enhanced tensor components - all operate on bond_dim
         self.disentanglers = nn.ModuleList([
-            EnhancedDisentangler(config.physical_dim, config.bond_dim, config.dropout)
+            EnhancedDisentangler(dim, dim, config.dropout)
             for _ in range(config.num_layers)
         ])
 
         self.isometries = nn.ModuleList([
-            EnhancedIsometry(config.physical_dim, config.bond_dim)
+            EnhancedIsometry(dim, dim)
             for _ in range(config.num_layers)
         ])
 
-        # Input embedding (will be initialized on first forward)
+        # Input embedding
         self.input_embedding = None
+        self.bond_dim = dim
 
-        # Output projection to fixed dimension
-        self.output_dim = config.bond_dim * 4  # Account for variable site counts
+        # Output projection
+        self.output_dim = dim * 4
         self.output_projection = None
 
-        # Intrinsic motivation module
+        # Intrinsic motivation
         self.intrinsic_motivation = MERAIntrinsicMotivation(config)
-
-        # Φ_Q computer for direct access
         self.phi_q_computer = PhiQComputer()
 
-        # Scale consistency loss
+        # Scale consistency projections
         self.scale_consistency_projections = nn.ModuleDict()
 
-        # Track RG eigenvalues
+        # RG eigenvalues history
         self.rg_eigenvalues_history = []
 
     def _ensure_input_embedding(self, input_dim: int, device: torch.device):
         """Lazily initialize input embedding"""
-        if self.input_embedding is None:
+        if self.input_embedding is None or self.input_embedding[0].in_features != input_dim:
             self.input_embedding = nn.Sequential(
-                nn.Linear(input_dim, self.config.physical_dim * 2),
+                nn.Linear(input_dim, self.bond_dim * 2),
                 nn.GELU(),
-                nn.Linear(self.config.physical_dim * 2, self.config.physical_dim),
+                nn.Linear(self.bond_dim * 2, self.bond_dim),
+                nn.LayerNorm(self.bond_dim),
             ).to(device)
 
     def _ensure_output_projection(self, final_dim: int, device: torch.device):
@@ -519,36 +466,18 @@ class EnhancedTensorNetworkMERA(nn.Module):
             ).to(device)
 
     def encode_sequence(self, sequence: torch.Tensor) -> List[torch.Tensor]:
-        """
-        Encode input sequence to tensor network format.
-
-        Args:
-            sequence: (batch, seq_len, input_dim)
-
-        Returns:
-            List of (batch, physical_dim) tensors
-        """
+        """Encode input sequence to tensor network format."""
         batch_size, seq_len, input_dim = sequence.shape
         self._ensure_input_embedding(input_dim, sequence.device)
 
-        # Embed and normalize
-        embedded = self.input_embedding(sequence)  # (B, T, physical_dim)
-        embedded = F.normalize(embedded, dim=-1)
+        # Embed each timestep
+        embedded = self.input_embedding(sequence)  # (B, T, bond_dim)
 
-        # Convert to list
+        # Convert to list of sites
         return [embedded[:, t, :] for t in range(seq_len)]
 
     def apply_layer(self, sites: List[torch.Tensor], layer_idx: int) -> List[torch.Tensor]:
-        """
-        Apply one MERA layer: disentangle then coarse-grain.
-
-        Args:
-            sites: List of (batch, dim) tensors
-            layer_idx: Layer index
-
-        Returns:
-            Coarse-grained sites (approximately half the count)
-        """
+        """Apply one MERA layer: disentangle then coarse-grain."""
         if len(sites) < 2:
             return sites
 
@@ -564,29 +493,20 @@ class EnhancedTensorNetworkMERA(nn.Module):
         if len(sites) % 2 == 1:
             disentangled.append(sites[-1])
 
-        # Phase 2: Coarse-grain pairs with isometry
+        # Phase 2: Coarse-grain pairs
         coarse_grained = []
         for i in range(0, len(disentangled) - 1, 2):
             coarse = isometry(disentangled[i], disentangled[i + 1])
             coarse_grained.append(coarse)
 
         if len(disentangled) % 2 == 1:
-            # Handle odd site - project to bond_dim
-            last = disentangled[-1]
-            if last.shape[-1] != self.config.bond_dim:
-                key = f'odd_proj_{layer_idx}'
-                if key not in self.scale_consistency_projections:
-                    self.scale_consistency_projections[key] = nn.Linear(
-                        last.shape[-1], self.config.bond_dim
-                    ).to(last.device)
-                last = self.scale_consistency_projections[key](last)
-            coarse_grained.append(last)
+            coarse_grained.append(disentangled[-1])
 
         return coarse_grained
 
     def compute_rg_eigenvalues(self, sites_before: List[torch.Tensor],
                                 sites_after: List[torch.Tensor]) -> List[float]:
-        """Compute RG flow eigenvalues for scale analysis"""
+        """Compute RG flow eigenvalues"""
         eigenvalues = []
 
         with torch.no_grad():
@@ -602,7 +522,7 @@ class EnhancedTensorNetworkMERA(nn.Module):
         return eigenvalues
 
     def compute_constraint_loss(self) -> torch.Tensor:
-        """Compute total constraint loss (unitarity + isometry)"""
+        """Compute total constraint loss"""
         loss = torch.tensor(0.0, device=next(self.parameters()).device)
 
         if self.config.enforce_unitarity:
@@ -616,11 +536,7 @@ class EnhancedTensorNetworkMERA(nn.Module):
         return loss
 
     def compute_scale_consistency_loss(self, layer_states: List[List[torch.Tensor]]) -> torch.Tensor:
-        """
-        Compute scale consistency loss across layers.
-
-        Ensures representations are coherent across scales.
-        """
+        """Compute scale consistency loss"""
         if len(layer_states) < 2:
             return torch.tensor(0.0, device=layer_states[0][0].device)
 
@@ -632,10 +548,8 @@ class EnhancedTensorNetworkMERA(nn.Module):
 
             for i, site_coarse in enumerate(sites_coarse):
                 if 2*i + 1 < len(sites_fine):
-                    # Combine fine sites
                     combined = torch.cat([sites_fine[2*i], sites_fine[2*i+1]], dim=-1)
 
-                    # Project to coarse dimension
                     key = f'scale_proj_{layer_idx}_{combined.shape[-1]}_{site_coarse.shape[-1]}'
                     if key not in self.scale_consistency_projections:
                         self.scale_consistency_projections[key] = nn.Linear(
@@ -643,21 +557,12 @@ class EnhancedTensorNetworkMERA(nn.Module):
                         ).to(combined.device)
 
                     projected = self.scale_consistency_projections[key](combined)
-                    total_loss = total_loss + F.mse_loss(projected, site_coarse)
+                    total_loss = total_loss + F.mse_loss(projected, site_coarse.detach())
 
         return total_loss * 0.1
 
     def forward(self, sequence: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
-        """
-        Forward pass through enhanced MERA.
-
-        Args:
-            sequence: (batch, seq_len, input_dim)
-
-        Returns:
-            latent: (batch, output_dim) representation
-            aux: Dictionary with all auxiliary outputs
-        """
+        """Forward pass through enhanced MERA."""
         # Encode sequence
         sites = self.encode_sequence(sequence)
 
@@ -670,8 +575,9 @@ class EnhancedTensorNetworkMERA(nn.Module):
         for layer_idx in range(self.config.num_layers):
             # Compute Φ_Q before coarse-graining
             if self.config.enable_phi_q and layer_idx in self.config.phi_q_layers:
-                phi_q = self.phi_q_computer(sites)
-                phi_q_values.append(phi_q)
+                if len(sites) >= 2:
+                    phi_q = self.phi_q_computer(sites)
+                    phi_q_values.append(phi_q)
 
             sites_before = sites
             sites = self.apply_layer(sites, layer_idx)
@@ -683,6 +589,10 @@ class EnhancedTensorNetworkMERA(nn.Module):
 
             layer_states.append(sites)
 
+            # Stop if we've reduced to a single site
+            if len(sites) <= 1:
+                break
+
         # Final latent representation
         if len(sites) > 0:
             final_concat = torch.cat(sites, dim=-1)
@@ -693,7 +603,7 @@ class EnhancedTensorNetworkMERA(nn.Module):
         latent = self.output_projection(final_concat)
 
         # Aggregate Φ_Q
-        phi_q_total = torch.stack(phi_q_values).mean(dim=0) if phi_q_values else None
+        phi_q_total = torch.stack(phi_q_values).mean(dim=0) if phi_q_values else torch.zeros(sequence.shape[0], device=sequence.device)
 
         # Store RG eigenvalues
         if all_rg_eigenvalues:
@@ -723,17 +633,12 @@ class EnhancedTensorNetworkMERA(nn.Module):
         return latent, aux
 
     def get_total_loss(self, aux: Dict) -> torch.Tensor:
-        """Get total auxiliary loss for training"""
+        """Get total auxiliary loss"""
         return aux['constraint_loss'] + aux['scale_consistency_loss']
 
 
 class MERAWorldModelEncoder(nn.Module):
-    """
-    MERA-based encoder for world models (e.g., DreamerV3).
-
-    Replaces standard MLP/CNN encoders with MERA for hierarchical
-    temporal representation learning.
-    """
+    """MERA-based encoder for world models."""
 
     def __init__(self, obs_dim: int, latent_dim: int, config: Optional[EnhancedMERAConfig] = None):
         super().__init__()
@@ -741,34 +646,21 @@ class MERAWorldModelEncoder(nn.Module):
         if config is None:
             config = EnhancedMERAConfig(
                 num_layers=3,
-                bond_dim=latent_dim // 4,
-                physical_dim=min(32, obs_dim),
+                bond_dim=max(8, latent_dim // 8),
+                physical_dim=max(8, latent_dim // 8),
             )
 
         self.config = config
         self.obs_dim = obs_dim
         self.latent_dim = latent_dim
 
-        # MERA backbone
         self.mera = EnhancedTensorNetworkMERA(config)
-
-        # Project MERA output to latent_dim
         self.latent_projection = nn.Linear(self.mera.output_dim, latent_dim)
 
     def forward(self, obs_sequence: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
-        """
-        Encode observation sequence.
-
-        Args:
-            obs_sequence: (batch, seq_len, obs_dim)
-
-        Returns:
-            latent: (batch, latent_dim)
-            aux: Auxiliary outputs including Φ_Q
-        """
+        """Encode observation sequence."""
         mera_out, aux = self.mera(obs_sequence)
         latent = self.latent_projection(mera_out)
-
         return latent, aux
 
 
@@ -784,7 +676,7 @@ if __name__ == "__main__":
     config = EnhancedMERAConfig(
         num_layers=3,
         bond_dim=8,
-        physical_dim=4,
+        physical_dim=8,
         temporal_window=50,
         enable_phi_q=True,
         enforce_isometry=True,
@@ -808,9 +700,9 @@ if __name__ == "__main__":
 
     print(f"   Input shape: {sequence.shape}")
     print(f"   Latent shape: {latent.shape}")
-    print(f"   Φ_Q shape: {aux['phi_q'].shape if aux['phi_q'] is not None else 'None'}")
+    print(f"   Φ_Q shape: {aux['phi_q'].shape}")
+    print(f"   Φ_Q mean: {aux['phi_q'].mean().item():.4f}")
     print(f"   Sites per layer: {aux['num_sites_per_layer']}")
-    print(f"   RG eigenvalues: {aux['rg_eigenvalues'][:5]}..." if aux['rg_eigenvalues'] else "   RG eigenvalues: []")
 
     # Test losses
     print("\n2. Constraint losses...")

@@ -28,6 +28,10 @@ from dataclasses import dataclass, asdict
 import matplotlib.pyplot as plt
 
 # Import MERA modules
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+
 from mera_enhanced import (
     EnhancedMERAConfig,
     EnhancedTensorNetworkMERA,
