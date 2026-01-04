@@ -43,6 +43,11 @@ class EnhancedMERAConfig:
     enforce_unitarity: bool = True
     unitarity_weight: float = 0.1  # Increased for better unitarity constraint
 
+    # RG flow regularization
+    enforce_rg_fixed_point: bool = True
+    rg_eigenvalue_weight: float = 0.05  # Loss weight for |λ - 1|²
+    rg_target_eigenvalue: float = 1.0   # Target RG eigenvalue (fixed point)
+
     # Φ_Q computation
     enable_phi_q: bool = True
     phi_q_layers: List[int] = field(default_factory=lambda: [0, 1, 2])
@@ -54,6 +59,7 @@ class EnhancedMERAConfig:
     # Training
     use_gradient_checkpointing: bool = False
     dropout: float = 0.0
+    use_identity_init: bool = True  # Initialize isometries near identity
 
 
 # =============================================================================
@@ -152,17 +158,58 @@ class TrueIsometry(nn.Module):
     The isometry should satisfy w†w ≈ I (up to the smaller dimension).
     """
 
-    def __init__(self, d_in: int, d_out: int):
+    def __init__(self, d_in: int, d_out: int, use_identity_init: bool = True):
         super().__init__()
         self.d_in = d_in
         self.d_out = d_out
 
-        # Initialize as isometry
-        tensor = self._isometry_init(d_in, d_out)
+        # Initialize as isometry - use identity-based init for better RG flow
+        if use_identity_init:
+            tensor = self._identity_based_init(d_in, d_out)
+        else:
+            tensor = self._isometry_init(d_in, d_out)
         self.tensor = nn.Parameter(tensor)
 
+    def _identity_based_init(self, d_in: int, d_out: int) -> torch.Tensor:
+        """
+        Initialize near identity for stable RG flow.
+
+        For RG fixed point, we want the isometry to approximately preserve
+        norm: ||w(s1, s2)|| ≈ ||s1|| + ||s2||. This is achieved by
+        initializing close to a "averaging" operation plus small noise.
+        """
+        # Shape: (d_out, d_in, d_in)
+        tensor = torch.zeros(d_out, d_in, d_in)
+
+        # For each output dimension, create a near-identity mapping
+        # that averages the two inputs (which preserves norm for RG flow)
+        min_dim = min(d_out, d_in)
+        for i in range(min_dim):
+            # Diagonal elements: average of corresponding input dimensions
+            # w[i, i, i] combines site1[i] and site2[i] into output[i]
+            tensor[i, i, i] = 1.0 / math.sqrt(2)  # Normalized averaging
+
+        # Add small noise for symmetry breaking
+        noise = torch.randn(d_out, d_in, d_in) * 0.1
+        tensor = tensor + noise
+
+        # Ensure isometry constraint approximately holds
+        # Re-orthogonalize using SVD
+        flat = tensor.reshape(d_out, d_in * d_in)
+        u, s, vh = torch.linalg.svd(flat, full_matrices=False)
+
+        # Scale singular values toward 1 (for isometry)
+        s_scaled = 0.7 * torch.ones_like(s) + 0.3 * s / (s.max() + 1e-6)
+
+        if d_out <= d_in * d_in:
+            result = u @ torch.diag(s_scaled) @ vh[:d_out, :]
+        else:
+            result = u @ torch.diag(s_scaled) @ vh
+
+        return result.reshape(d_out, d_in, d_in)
+
     def _isometry_init(self, d_in: int, d_out: int) -> torch.Tensor:
-        """Initialize with isometry structure: w†w = I"""
+        """Initialize with isometry structure: w†w = I (original method)"""
         # Shape: (d_out, d_in * d_in)
         flat = torch.randn(d_out, d_in * d_in)
 
@@ -393,7 +440,10 @@ class EnhancedTensorNetworkMERA(nn.Module):
 
         # Layer 0: physical_dim → bond_dim
         self.disentangler_0 = TrueDisentangler(config.physical_dim, config.physical_dim)
-        self.isometry_0 = TrueIsometry(config.physical_dim, config.bond_dim)
+        self.isometry_0 = TrueIsometry(
+            config.physical_dim, config.bond_dim,
+            use_identity_init=config.use_identity_init
+        )
 
         # Layers 1+: bond_dim → bond_dim
         self.disentanglers = nn.ModuleList([
@@ -401,7 +451,8 @@ class EnhancedTensorNetworkMERA(nn.Module):
             for _ in range(config.num_layers - 1)
         ])
         self.isometries = nn.ModuleList([
-            TrueIsometry(config.bond_dim, config.bond_dim)
+            TrueIsometry(config.bond_dim, config.bond_dim,
+                        use_identity_init=config.use_identity_init)
             for _ in range(config.num_layers - 1)
         ])
 
@@ -507,19 +558,61 @@ class EnhancedTensorNetworkMERA(nn.Module):
         return coarse
 
     def compute_rg_eigenvalues(self, sites_before: List[torch.Tensor],
-                                sites_after: List[torch.Tensor]) -> List[float]:
-        """Compute RG flow eigenvalues"""
+                                sites_after: List[torch.Tensor],
+                                return_tensors: bool = False) -> List:
+        """
+        Compute RG flow eigenvalues.
+
+        Args:
+            sites_before: Sites before coarse-graining
+            sites_after: Sites after coarse-graining
+            return_tensors: If True, return tensors for gradient computation
+
+        Returns:
+            List of eigenvalues (floats or tensors)
+        """
         eigenvalues = []
-        with torch.no_grad():
-            for i, site_after in enumerate(sites_after):
-                if 2*i + 1 < len(sites_before):
-                    # Handle dimension mismatch
-                    s1, s2 = sites_before[2*i], sites_before[2*i+1]
-                    norm_before = (torch.norm(s1, dim=-1) + torch.norm(s2, dim=-1)).mean().item()
-                    norm_after = torch.norm(site_after, dim=-1).mean().item()
-                    if norm_before > 1e-6:
-                        eigenvalues.append(norm_after / norm_before)
+
+        for i, site_after in enumerate(sites_after):
+            if 2*i + 1 < len(sites_before):
+                s1, s2 = sites_before[2*i], sites_before[2*i+1]
+                norm_before = torch.norm(s1, dim=-1) + torch.norm(s2, dim=-1)
+                norm_after = torch.norm(site_after, dim=-1)
+
+                # Avoid division by zero
+                valid_mask = norm_before > 1e-6
+                if valid_mask.any():
+                    ratio = norm_after / (norm_before + 1e-6)
+                    if return_tensors:
+                        eigenvalues.append(ratio.mean())
+                    else:
+                        eigenvalues.append(ratio.mean().item())
+
         return eigenvalues
+
+    def compute_rg_eigenvalue_loss(self, sites_before: List[torch.Tensor],
+                                    sites_after: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Compute loss to push RG eigenvalues toward fixed point (λ = 1).
+
+        At an RG fixed point, the coarse-graining transformation preserves
+        the norm ratio: ||w(s1, s2)|| / (||s1|| + ||s2||) ≈ 1
+        """
+        if not self.config.enforce_rg_fixed_point:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+
+        eigenvalues = self.compute_rg_eigenvalues(sites_before, sites_after, return_tensors=True)
+
+        if not eigenvalues:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+
+        # Loss: sum of (λ - target)²
+        target = self.config.rg_target_eigenvalue
+        loss = torch.tensor(0.0, device=eigenvalues[0].device)
+        for ev in eigenvalues:
+            loss = loss + (ev - target) ** 2
+
+        return loss * self.config.rg_eigenvalue_weight / len(eigenvalues)
 
     def compute_constraint_loss(self) -> torch.Tensor:
         """Total constraint loss for unitarity and isometry"""
@@ -568,6 +661,7 @@ class EnhancedTensorNetworkMERA(nn.Module):
         layer_states = [sites]
         phi_q_values = []
         all_rg_eigenvalues = []
+        rg_eigenvalue_loss = torch.tensor(0.0, device=sequence.device)
 
         # Layer 0: physical_dim → bond_dim
         if self.config.enable_phi_q and 0 in self.config.phi_q_layers and len(sites) >= 2:
@@ -578,6 +672,8 @@ class EnhancedTensorNetworkMERA(nn.Module):
         rg_evs = self.compute_rg_eigenvalues(sites_before, sites)
         if rg_evs:
             all_rg_eigenvalues.extend(rg_evs)
+        # Compute RG loss for this layer
+        rg_eigenvalue_loss = rg_eigenvalue_loss + self.compute_rg_eigenvalue_loss(sites_before, sites)
         layer_states.append(sites)
 
         # Layers 1+: bond_dim → bond_dim
@@ -593,6 +689,8 @@ class EnhancedTensorNetworkMERA(nn.Module):
             rg_evs = self.compute_rg_eigenvalues(sites_before, sites)
             if rg_evs:
                 all_rg_eigenvalues.extend(rg_evs)
+            # Compute RG loss for this layer
+            rg_eigenvalue_loss = rg_eigenvalue_loss + self.compute_rg_eigenvalue_loss(sites_before, sites)
             layer_states.append(sites)
 
         # Final latent
@@ -630,6 +728,7 @@ class EnhancedTensorNetworkMERA(nn.Module):
             'rg_eigenvalues': all_rg_eigenvalues,
             'constraint_loss': constraint_loss,
             'scale_consistency_loss': scale_loss,
+            'rg_eigenvalue_loss': rg_eigenvalue_loss,
             'intrinsic_rewards': intrinsic_rewards,
             'num_sites_per_layer': [len(states) for states in layer_states],
         }
@@ -637,7 +736,7 @@ class EnhancedTensorNetworkMERA(nn.Module):
         return latent, aux
 
     def get_total_loss(self, aux: Dict) -> torch.Tensor:
-        return aux['constraint_loss'] + aux['scale_consistency_loss']
+        return aux['constraint_loss'] + aux['scale_consistency_loss'] + aux['rg_eigenvalue_loss']
 
 
 class MERAWorldModelEncoder(nn.Module):
