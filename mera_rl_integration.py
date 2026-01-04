@@ -50,8 +50,8 @@ class MERATrainingConfig:
     # Intrinsic motivation weights
     phi_q_weight: float = 0.1
     entanglement_weight: float = 0.05
-    scale_consistency_weight: float = 0.1
-    constraint_weight: float = 0.01
+    scale_consistency_weight: float = 0.01  # Reduced for better RG flow
+    constraint_weight: float = 0.1  # Increased for isometry enforcement
 
     # Training
     learning_rate: float = 3e-4

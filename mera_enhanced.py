@@ -39,9 +39,9 @@ class EnhancedMERAConfig:
     # Physics-inspired constraints
     causal_velocity: float = 1.0
     enforce_isometry: bool = True
-    isometry_weight: float = 0.01
+    isometry_weight: float = 0.1  # Increased for better isometry constraint
     enforce_unitarity: bool = True
-    unitarity_weight: float = 0.01
+    unitarity_weight: float = 0.1  # Increased for better unitarity constraint
 
     # Φ_Q computation
     enable_phi_q: bool = True
