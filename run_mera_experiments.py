@@ -37,7 +37,6 @@ from mera_enhanced import (
     EnhancedTensorNetworkMERA,
     MERAWorldModelEncoder,
     PhiQComputer,
-    UnitaryInitializer
 )
 from mera_rl_integration import (
     MERATrainingConfig,
@@ -120,10 +119,12 @@ class ExperimentRunner:
         print("\n3. Testing constraint losses...")
         try:
             constraint_loss = aux['constraint_loss']
+            rg_loss = aux.get('rg_eigenvalue_loss', torch.tensor(0.0))
             assert constraint_loss.item() >= 0, "Negative constraint loss"
             assert not torch.isnan(constraint_loss), "NaN in constraint loss"
             results['constraint_loss'] = True
             print(f"   ✓ Constraint loss OK: {constraint_loss.item():.6f}")
+            print(f"   ✓ RG eigenvalue loss: {rg_loss.item():.6f}")
         except Exception as e:
             results['constraint_loss'] = False
             print(f"   ✗ Constraint loss FAILED: {e}")
@@ -359,16 +360,28 @@ class ExperimentRunner:
         1. Eigenvalue distribution across layers
         2. Fixed point detection (λ ≈ 1)
         3. Scaling behavior
+        4. RG eigenvalue loss (new)
         """
         print("\n" + "=" * 70)
         print("RG FLOW ANALYSIS")
         print("=" * 70)
 
-        config = EnhancedMERAConfig(num_layers=4, bond_dim=8, physical_dim=4)
+        # Test with identity-based initialization and RG regularization
+        config = EnhancedMERAConfig(
+            num_layers=4,
+            bond_dim=8,
+            physical_dim=4,
+            use_identity_init=True,
+            enforce_rg_fixed_point=True,
+            rg_eigenvalue_weight=0.05,
+        )
         mera = EnhancedTensorNetworkMERA(config).to(self.device)
         mera.eval()
 
         all_eigenvalues = []
+        rg_losses = []
+
+        print("\n   Testing with identity initialization + RG regularization...")
 
         for _ in range(50):
             data = torch.randn(8, 50, 64).to(self.device)
@@ -377,6 +390,9 @@ class ExperimentRunner:
 
             if aux['rg_eigenvalues']:
                 all_eigenvalues.extend(aux['rg_eigenvalues'])
+
+            if 'rg_eigenvalue_loss' in aux:
+                rg_losses.append(aux['rg_eigenvalue_loss'].item())
 
         if all_eigenvalues:
             eigenvalues = np.array(all_eigenvalues)
@@ -387,12 +403,43 @@ class ExperimentRunner:
                 'min': float(np.min(eigenvalues)),
                 'max': float(np.max(eigenvalues)),
                 'near_fixed_point': float(np.mean(np.abs(eigenvalues - 1.0) < 0.1)),
+                'rg_loss_mean': float(np.mean(rg_losses)) if rg_losses else 0.0,
                 'histogram': np.histogram(eigenvalues, bins=20)[0].tolist(),
+                'identity_init': True,
+                'rg_regularization': True,
             }
 
             print(f"   Mean eigenvalue: {results['mean']:.4f} ± {results['std']:.4f}")
             print(f"   Range: [{results['min']:.4f}, {results['max']:.4f}]")
             print(f"   Near fixed point (|λ-1| < 0.1): {results['near_fixed_point']*100:.1f}%")
+            print(f"   RG eigenvalue loss: {results['rg_loss_mean']:.6f}")
+
+            # Compare with old initialization
+            print("\n   Comparing with random initialization (no RG loss)...")
+            config_old = EnhancedMERAConfig(
+                num_layers=4,
+                bond_dim=8,
+                physical_dim=4,
+                use_identity_init=False,
+                enforce_rg_fixed_point=False,
+            )
+            mera_old = EnhancedTensorNetworkMERA(config_old).to(self.device)
+            mera_old.eval()
+
+            old_eigenvalues = []
+            for _ in range(50):
+                data = torch.randn(8, 50, 64).to(self.device)
+                with torch.no_grad():
+                    _, aux = mera_old(data)
+                if aux['rg_eigenvalues']:
+                    old_eigenvalues.extend(aux['rg_eigenvalues'])
+
+            if old_eigenvalues:
+                old_evs = np.array(old_eigenvalues)
+                old_near_fp = np.mean(np.abs(old_evs - 1.0) < 0.1) * 100
+                print(f"   Old init mean: {np.mean(old_evs):.4f}, near FP: {old_near_fp:.1f}%")
+                results['old_init_mean'] = float(np.mean(old_evs))
+                results['old_init_near_fp'] = float(old_near_fp)
         else:
             results = {'error': 'No eigenvalues computed'}
 
@@ -456,10 +503,16 @@ def main():
                        help='Which experiment to run')
     parser.add_argument('--output_dir', type=str, default='experiments',
                        help='Output directory for results')
-    parser.add_argument('--num_steps', type=int, default=100,
-                       help='Number of training steps for ablation')
+    parser.add_argument('--num_steps', type=int, default=500,
+                       help='Number of training steps for ablation (default: 500)')
+    parser.add_argument('--long_training', action='store_true',
+                       help='Use extended training (1000+ steps) for better RG convergence')
 
     args = parser.parse_args()
+
+    # Use longer training if specified
+    if args.long_training:
+        args.num_steps = max(args.num_steps, 1000)
 
     print("=" * 70)
     print("MERA TENSOR NETWORK EXPERIMENTS")
