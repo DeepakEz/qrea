@@ -50,8 +50,11 @@ class MERATrainingConfig:
     # Intrinsic motivation weights
     phi_q_weight: float = 0.1
     entanglement_weight: float = 0.05
-    scale_consistency_weight: float = 0.01  # Reduced for better RG flow
+    scale_consistency_weight: float = 0.001  # Reduced: was hurting performance
     constraint_weight: float = 0.1  # Increased for isometry enforcement
+
+    # Warmup for scale consistency (start at 0, ramp to full weight)
+    scale_loss_warmup_steps: int = 1000  # Steps before full scale loss
 
     # Training
     learning_rate: float = 3e-4
@@ -257,14 +260,18 @@ class MERAEnhancedWorldModel(nn.Module):
         return self.decoder(latent)
 
     def get_mera_losses(self, mera_aux: Dict) -> Dict[str, torch.Tensor]:
-        """Extract MERA-specific losses"""
+        """Extract MERA-specific losses.
+
+        Note: Weights are already applied inside MERA's compute_* methods
+        (via EnhancedMERAConfig), so we don't apply them again here.
+        """
         losses = {}
 
         if self.config.use_constraint_loss:
-            losses['constraint'] = mera_aux['constraint_loss'] * self.config.constraint_weight
+            losses['constraint'] = mera_aux['constraint_loss']  # Weight already applied
 
         if self.config.use_scale_loss:
-            losses['scale_consistency'] = mera_aux['scale_consistency_loss'] * self.config.scale_consistency_weight
+            losses['scale_consistency'] = mera_aux['scale_consistency_loss']  # Weight already applied
 
         return losses
 

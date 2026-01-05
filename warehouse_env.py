@@ -146,7 +146,11 @@ class WarehouseEnv(gym.Env):
         self.current_step = 0
         self.episode_reward = 0.0
         self.next_package_id = 0
-        
+
+        # Task variant configuration (set by TaskVariant.apply_*)
+        self.package_spawn_zones: Optional[List[Dict]] = None  # Clustered spawning
+        self.dynamic_priorities: bool = False  # Dynamic priority changes
+
         # Spaces
         self.action_space = self._create_action_space()
         self.observation_space = self._create_observation_space()
@@ -403,32 +407,55 @@ class WarehouseEnv(gym.Env):
             self.stats['total_distance'] += min_dist
     
     def _spawn_packages(self, initial: bool = False):
-        """Spawn new packages"""
+        """Spawn new packages.
+
+        Supports task variants:
+        - package_spawn_zones: If set, spawns packages in clusters
+        - dynamic_priorities: If True, priorities change over episode time
+        """
         num_spawn = self.num_packages if initial else 1
-        
+
         for _ in range(num_spawn):
             # Random package type
             pkg_type = np.random.choice(list(self.package_types.keys()))
             pkg_config = self.package_types[pkg_type]
-            
-            # Random spawn at pickup station
-            pickup_station = [s for s in self.stations if s.type == "pickup"][0]
-            spawn_pos = pickup_station.position + np.random.randn(2) * 0.5
-            
+
+            # Determine spawn position
+            if self.package_spawn_zones is not None:
+                # Clustered spawning: pick a random zone and spawn within it
+                zone = np.random.choice(self.package_spawn_zones)
+                center = np.array(zone['center'], dtype=np.float32)
+                radius = zone.get('radius', 5.0)
+                spawn_pos = center + np.random.randn(2) * radius * 0.3
+            else:
+                # Default: spawn at pickup station
+                pickup_station = [s for s in self.stations if s.type == "pickup"][0]
+                spawn_pos = pickup_station.position + np.random.randn(2) * 0.5
+
             # Random delivery station
             delivery_stations = [s for s in self.stations if s.type.startswith("delivery")]
             dest_station = np.random.choice(delivery_stations)
-            
+
+            # Determine priority
+            priority_val = pkg_config['priority']
+            if self.dynamic_priorities:
+                # Priority changes based on episode time: early = normal, late = urgent
+                time_factor = self.current_step / max(1, self.max_steps)
+                if time_factor > 0.7:
+                    priority_val = max(priority_val, 2)  # Urgent
+                elif time_factor > 0.4:
+                    priority_val = max(priority_val, 1)  # High
+
             package = Package(
                 id=self.next_package_id,
                 position=spawn_pos,
                 destination=dest_station.position,
                 weight=pkg_config['weight'],
-                priority=PackagePriority(pkg_config['priority']),
+                priority=PackagePriority(priority_val),
                 reward=pkg_config['reward'],
                 spawn_time=self.current_step * self.dt
             )
-            
+
             self.packages.append(package)
             self.next_package_id += 1
     
