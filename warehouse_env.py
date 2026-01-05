@@ -382,9 +382,9 @@ class WarehouseEnv(gym.Env):
         """Try to pick up or deliver a package"""
         if robot.carrying_package is not None:
             return  # Already carrying
-        
-        # Robot must be nearly stationary to pickup (realistic constraint)
-        if robot.speed > 0.3:  # max speed threshold for pickup
+
+        # Robot must slow down to pickup (relaxed for learning)
+        if robot.speed > 1.0:  # Relaxed from 0.3 - still requires slowing down
             return
         
         # Find nearest unassigned package
@@ -628,56 +628,72 @@ class WarehouseEnv(gym.Env):
         return obs
     
     def _calculate_rewards(self) -> Dict[int, float]:
-        """Calculate rewards for each robot"""
+        """Calculate rewards for each robot.
+
+        Reward structure designed to guide learning:
+        - Large reward for delivery (main objective)
+        - Medium reward for pickup (critical milestone)
+        - Progress reward for moving toward goal (shaping)
+        - Small collision penalty (don't dominate learning)
+        """
         rewards = {}
-        
+
         for robot in self.robots:
             reward = 0.0
-            
-            # Package delivery reward (main objective)
+
+            # === DELIVERY REWARD (main objective) ===
             if robot.carrying_package is not None:
                 pkg = self._get_package(robot.carrying_package)
                 if pkg and pkg.is_delivered:
-                    reward += pkg.reward
-            
-            # Pickup success reward (critical intermediate reward)
-            # Check if robot just picked up a package this step
+                    reward += pkg.reward  # +100/200/300
+
+            # === PICKUP REWARD (critical milestone) ===
             if robot.carrying_package is not None:
                 pkg = self._get_package(robot.carrying_package)
                 if pkg and pkg.pickup_time is not None:
-                    # Give reward if pickup happened recently (within last second)
                     time_since_pickup = self.current_step * self.dt - pkg.pickup_time
                     if time_since_pickup < 0.2:  # just picked up
-                        reward += 5.0  # immediate pickup reward
-            
-            # Proximity reward for approaching packages (sparse but helpful)
-            if robot.carrying_package is None:
+                        reward += 10.0  # Increased from 5.0
+
+            # === PROGRESS REWARDS (shaping) ===
+            if robot.carrying_package is not None:
+                # Carrying package: reward for moving toward destination
+                pkg = self._get_package(robot.carrying_package)
+                if pkg and not pkg.is_delivered:
+                    dist_to_dest = np.linalg.norm(robot.position - pkg.destination)
+                    # Reward inversely proportional to distance (closer = better)
+                    # Max grid is ~50x50, so max dist is ~70. Normalize.
+                    progress_reward = 2.0 * (1.0 - dist_to_dest / 70.0)
+                    reward += max(0, progress_reward)
+            else:
+                # Not carrying: reward for approaching packages
                 nearest_pkg_dist = float('inf')
                 for pkg in self.packages:
                     if not pkg.is_delivered and pkg.assigned_robot is None:
                         dist = np.linalg.norm(robot.position - pkg.position)
                         if dist < nearest_pkg_dist:
                             nearest_pkg_dist = dist
-                
-                # Small reward for being close to packages
-                if nearest_pkg_dist < 3.0:
-                    reward += 0.1 * (3.0 - nearest_pkg_dist) / 3.0
-            
-            # Efficiency penalty (inverse of energy used)
-            reward -= 0.01 * self.battery_drain['moving'] * self.dt
-            
-            # Collision penalty
+
+                if nearest_pkg_dist < float('inf'):
+                    # Reward for being close to packages (up to +1.0)
+                    progress_reward = 1.0 * (1.0 - min(nearest_pkg_dist, 20.0) / 20.0)
+                    reward += progress_reward
+
+            # === PENALTIES (reduced to not dominate) ===
+            # Collision penalty (reduced from -10.0)
             if robot.collision_count > 0:
-                reward -= 10.0 * robot.collision_count
+                reward -= 2.0 * robot.collision_count
                 robot.collision_count = 0
-            
-            # Battery penalty
+
+            # No energy penalty - was discouraging movement
+
+            # Low battery penalty (keep this for realism)
             if robot.battery < 0.2 * self.battery_capacity:
-                reward -= 1.0
-            
+                reward -= 0.5
+
             rewards[robot.id] = reward
             self.episode_reward += reward
-        
+
         return rewards
     
     def _get_package(self, package_id: int) -> Optional[Package]:
