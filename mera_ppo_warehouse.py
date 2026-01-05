@@ -240,6 +240,9 @@ class MERAWarehousePPO:
         self.encoder_type = encoder_type
         self.num_epochs = num_epochs
 
+        # Override max_steps for faster training (original is 5000, too long)
+        self.config['environment']['max_episode_steps'] = 500
+
         # Create environment
         self.env = WarehouseEnv(self.config)
         self.num_robots = self.config['environment']['num_robots']
@@ -256,10 +259,10 @@ class MERAWarehousePPO:
         self.lr = learning_config['learning_rate']
         self.grad_clip = learning_config['grad_clip']
 
-        # Training params
+        # Training params - increased for longer episodes
         self.history_len = 16
-        self.steps_per_epoch = 2048
-        self.num_minibatches = 4
+        self.steps_per_epoch = 4096  # Increased to ensure episodes complete
+        self.num_minibatches = 8
         self.update_epochs = 4
         self.clip_epsilon = 0.2
         self.entropy_coef = learning_config['actor_critic']['entropy_weight']
@@ -274,7 +277,7 @@ class MERAWarehousePPO:
             enable_phi_q=True,
             use_identity_init=True,
             enforce_rg_fixed_point=True,
-            rg_eigenvalue_weight=0.05,
+            rg_eigenvalue_weight=0.01,  # Reduced per experiment findings
         )
 
         # Create network
@@ -297,9 +300,17 @@ class MERAWarehousePPO:
         self.phi_q_history = []
         self.phi_q_vs_coordination = []
 
+        # Incremental epoch tracking
+        self.epoch_reward = 0.0
+        self.epoch_phi_q = []
+        self.epoch_steps = 0
+
         # Output
         self.output_dir = Path(f"./results_{encoder_type}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"  Environment: max_steps={self.env.max_steps}, robots={self.num_robots}")
+        print(f"  Steps per epoch: {self.steps_per_epoch}")
 
     def _reset_obs_history(self, observations: Dict[int, np.ndarray]):
         for robot_id, obs in observations.items():
@@ -324,6 +335,12 @@ class MERAWarehousePPO:
         robot_transitions = {i: [] for i in range(self.num_robots)}
         episode_phi_q = []
         episode_reward = 0.0
+        episode_steps = 0
+
+        # Track epoch-level metrics
+        epoch_total_reward = 0.0
+        epoch_phi_q_values = []
+        epoch_env_stats = None
 
         max_steps = self.steps_per_epoch // self.num_robots
 
@@ -338,6 +355,7 @@ class MERAWarehousePPO:
             log_probs_np = log_probs.cpu().numpy()
 
             episode_phi_q.append(phi_q)
+            epoch_phi_q_values.append(phi_q)
 
             # Execute in environment
             actions_dict = {i: actions_np[i] for i in range(self.num_robots)}
@@ -356,43 +374,57 @@ class MERAWarehousePPO:
                 ))
                 self.obs_history[i].append(next_obs[i])
                 episode_reward += rewards[i]
+                epoch_total_reward += rewards[i]
 
+            episode_steps += 1
             self.global_step += self.num_robots
 
+            # Check for episode end
             if dones.get('__all__', False):
                 self.episode_count += 1
 
                 # Get coordination metrics from environment
                 env_stats = self.env.get_statistics()
+                epoch_env_stats = env_stats  # Keep last stats
+
                 metrics = CoordinationMetrics(
                     total_collisions=env_stats['collisions'],
                     packages_delivered=env_stats['packages_delivered'],
                     total_distance=env_stats.get('total_distance', 0),
                     total_energy=env_stats.get('total_energy', 0.001),
-                    episode_length=step + 1,
+                    episode_length=episode_steps,
                     throughput=env_stats['throughput'],
-                    avg_waiting_time=env_stats['avg_waiting_time'],
+                    avg_waiting_time=env_stats.get('avg_waiting_time', 0),
                 )
 
                 self.coordination_history.append(asdict(metrics))
-                self.phi_q_history.append(np.mean(episode_phi_q))
 
-                # Track correlation
-                self.phi_q_vs_coordination.append((
-                    np.mean(episode_phi_q),
-                    metrics.synergy_score
-                ))
+                if episode_phi_q:
+                    avg_phi_q = np.mean(episode_phi_q)
+                    self.phi_q_history.append(avg_phi_q)
+                    self.phi_q_vs_coordination.append((avg_phi_q, metrics.synergy_score))
 
                 self.episode_rewards.append(episode_reward)
-                self.episode_lengths.append(step + 1)
+                self.episode_lengths.append(episode_steps)
 
-                # Reset
+                # Reset for next episode
                 observations = self.env.reset()
                 self._reset_obs_history(observations)
                 episode_phi_q = []
                 episode_reward = 0.0
+                episode_steps = 0
 
-        return robot_transitions, info if 'info' in dir() else {}
+        # If no episodes completed, still record epoch-level stats
+        if not self.coordination_history or epoch_env_stats is None:
+            # Get current stats even if episode didn't complete
+            env_stats = self.env.get_statistics()
+            epoch_env_stats = env_stats
+
+        # Store epoch-level phi_q for tracking
+        if epoch_phi_q_values:
+            self.epoch_phi_q = epoch_phi_q_values
+
+        return robot_transitions, {'env_stats': epoch_env_stats, 'epoch_reward': epoch_total_reward}
 
     def compute_returns(self, transitions: List[Transition]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute GAE returns and advantages"""
@@ -527,16 +559,33 @@ class MERAWarehousePPO:
         for epoch in range(1, self.num_epochs + 1):
             epoch_start = time.time()
 
-            robot_transitions, _ = self.collect_rollout()
+            robot_transitions, epoch_info = self.collect_rollout()
             self.update(robot_transitions)
 
             epoch_time = time.time() - epoch_start
 
             if epoch % 10 == 0 or epoch == 1:
-                avg_reward = np.mean(self.episode_rewards[-10:]) if self.episode_rewards else 0
-                avg_phi_q = np.mean(self.phi_q_history[-10:]) if self.phi_q_history else 0
+                # Use epoch-level info for current stats
+                env_stats = epoch_info.get('env_stats', {})
+                epoch_reward = epoch_info.get('epoch_reward', 0)
 
-                if self.coordination_history:
+                # Episode-based metrics (if episodes completed)
+                avg_reward = np.mean(self.episode_rewards[-10:]) if self.episode_rewards else epoch_reward
+
+                # Phi_Q from epoch or episodes
+                if hasattr(self, 'epoch_phi_q') and self.epoch_phi_q:
+                    avg_phi_q = np.mean(self.epoch_phi_q)
+                elif self.phi_q_history:
+                    avg_phi_q = np.mean(self.phi_q_history[-10:])
+                else:
+                    avg_phi_q = 0
+
+                # Coordination metrics from env_stats or history
+                if env_stats:
+                    avg_collisions = env_stats.get('collisions', 0)
+                    avg_delivered = env_stats.get('packages_delivered', 0)
+                    avg_throughput = env_stats.get('throughput', 0)
+                elif self.coordination_history:
                     recent = self.coordination_history[-10:]
                     avg_collisions = np.mean([m['total_collisions'] for m in recent])
                     avg_delivered = np.mean([m['packages_delivered'] for m in recent])
@@ -546,7 +595,7 @@ class MERAWarehousePPO:
 
                 correlation = self.compute_phi_q_correlation()
 
-                print(f"\nEpoch {epoch}/{self.num_epochs} ({epoch_time:.1f}s)")
+                print(f"\nEpoch {epoch}/{self.num_epochs} ({epoch_time:.1f}s) [Episodes: {self.episode_count}]")
                 print(f"  Reward:      {avg_reward:.2f}")
                 print(f"  Φ_Q:         {avg_phi_q:.4f}")
                 print(f"  Collisions:  {avg_collisions:.1f}")
