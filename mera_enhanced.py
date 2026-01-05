@@ -45,8 +45,9 @@ class EnhancedMERAConfig:
 
     # RG flow regularization
     enforce_rg_fixed_point: bool = True
-    rg_eigenvalue_weight: float = 0.05  # Loss weight for |λ - 1|²
+    rg_eigenvalue_weight: float = 0.01  # Reduced: too restrictive was hurting learning
     rg_target_eigenvalue: float = 1.0   # Target RG eigenvalue (fixed point)
+    rg_loss_warmup_steps: int = 1000    # Warmup before applying full RG loss
 
     # Φ_Q computation
     enable_phi_q: bool = True
