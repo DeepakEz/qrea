@@ -57,6 +57,10 @@ class EnhancedMERAConfig:
     phi_q_intrinsic_weight: float = 0.1
     entanglement_exploration_weight: float = 0.05
 
+    # Scale consistency (reduced - was too restrictive per experiment findings)
+    scale_consistency_weight: float = 0.001  # Was 0.1, hurting performance by -6.3%
+    scale_loss_warmup_steps: int = 1000  # Warmup before applying full scale loss
+
     # Training
     use_gradient_checkpointing: bool = False
     dropout: float = 0.0
@@ -435,6 +439,9 @@ class EnhancedTensorNetworkMERA(nn.Module):
         super().__init__()
         self.config = config
 
+        # Step counter for warmup (updated via set_step)
+        self.current_step = 0
+
         # Dimensions
         self.physical_dim = config.physical_dim
         self.bond_dim = config.bond_dim
@@ -473,6 +480,16 @@ class EnhancedTensorNetworkMERA(nn.Module):
 
         # RG tracking
         self.rg_eigenvalues_history = []
+
+    def set_step(self, step: int):
+        """Update step counter for warmup scheduling"""
+        self.current_step = step
+
+    def get_warmup_factor(self, warmup_steps: int) -> float:
+        """Get warmup factor (0 to 1) based on current step"""
+        if warmup_steps <= 0:
+            return 1.0
+        return min(1.0, self.current_step / warmup_steps)
 
     def _ensure_input_embedding(self, input_dim: int, device: torch.device):
         if self.input_embedding is None or self.input_embedding[0].in_features != input_dim:
@@ -598,6 +615,8 @@ class EnhancedTensorNetworkMERA(nn.Module):
 
         At an RG fixed point, the coarse-graining transformation preserves
         the norm ratio: ||w(s1, s2)|| / (||s1|| + ||s2||) ≈ 1
+
+        Applies warmup: loss is scaled from 0 to full weight over rg_loss_warmup_steps.
         """
         if not self.config.enforce_rg_fixed_point:
             return torch.tensor(0.0, device=next(self.parameters()).device)
@@ -613,7 +632,10 @@ class EnhancedTensorNetworkMERA(nn.Module):
         for ev in eigenvalues:
             loss = loss + (ev - target) ** 2
 
-        return loss * self.config.rg_eigenvalue_weight / len(eigenvalues)
+        # Apply warmup factor
+        warmup_factor = self.get_warmup_factor(self.config.rg_loss_warmup_steps)
+
+        return loss * self.config.rg_eigenvalue_weight * warmup_factor / len(eigenvalues)
 
     def compute_constraint_loss(self) -> torch.Tensor:
         """Total constraint loss for unitarity and isometry"""
@@ -632,7 +654,10 @@ class EnhancedTensorNetworkMERA(nn.Module):
         return loss
 
     def compute_scale_consistency_loss(self, layer_states: List[List[torch.Tensor]]) -> torch.Tensor:
-        """Scale consistency across layers"""
+        """Scale consistency across layers.
+
+        Applies warmup: loss is scaled from 0 to full weight over scale_loss_warmup_steps.
+        """
         if len(layer_states) < 2:
             return torch.tensor(0.0, device=layer_states[0][0].device)
 
@@ -653,7 +678,10 @@ class EnhancedTensorNetworkMERA(nn.Module):
                     projected = self.scale_projections[key](combined)
                     total_loss = total_loss + F.mse_loss(projected, site_coarse.detach())
 
-        return total_loss * 0.1
+        # Apply warmup factor
+        warmup_factor = self.get_warmup_factor(self.config.scale_loss_warmup_steps)
+
+        return total_loss * self.config.scale_consistency_weight * warmup_factor
 
     def forward(self, sequence: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
         """Forward pass through MERA"""

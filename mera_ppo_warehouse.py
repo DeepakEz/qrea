@@ -141,6 +141,10 @@ class MERAEncoder(nn.Module):
         latent, aux = self.mera(projected)
         return latent, aux
 
+    def set_step(self, step: int):
+        """Update step counter for warmup scheduling"""
+        self.mera.set_step(step)
+
 
 class PPOActorCritic(nn.Module):
     """PPO Actor-Critic with MERA or MLP encoder"""
@@ -221,6 +225,11 @@ class PPOActorCritic(nn.Module):
         log_prob = dist.log_prob(actions).sum(-1)
         entropy = dist.entropy().sum(-1)
         return value, log_prob, entropy, aux
+
+    def set_step(self, step: int):
+        """Update step counter for warmup scheduling (MERA only)"""
+        if self.encoder_type == "mera" and hasattr(self.encoder, 'set_step'):
+            self.encoder.set_step(step)
 
 
 # =============================================================================
@@ -378,6 +387,9 @@ class MERAWarehousePPO:
 
             episode_steps += 1
             self.global_step += self.num_robots
+
+            # Update MERA step counter for warmup scheduling
+            self.network.set_step(self.global_step)
 
             # Check for episode end
             if dones.get('__all__', False):
