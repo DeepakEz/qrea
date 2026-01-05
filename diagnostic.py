@@ -65,15 +65,16 @@ def main():
             break
 
         # Simple navigation controller
+        # Action space: linear_vel [-2, 2], angular_vel [-1.57, 1.57], gripper [0, 1]
         angle_to_pkg = np.arctan2(direction[1], direction[0])
         angle_diff = angle_to_pkg - robot.orientation
         while angle_diff > np.pi: angle_diff -= 2 * np.pi
         while angle_diff < -np.pi: angle_diff += 2 * np.pi
 
         if abs(angle_diff) > 0.3:
-            action = np.array([0.0, np.clip(angle_diff * 2, -1, 1), 0])  # rotate
+            action = np.array([0.0, np.clip(angle_diff * 2, -1.57, 1.57), 0])  # rotate
         else:
-            action = np.array([1.0, angle_diff * 0.5, 0])  # move forward
+            action = np.array([2.0, angle_diff * 0.5, 0])  # move forward at max speed
 
         actions = {i: np.zeros(3, dtype=np.float32) for i in range(8)}
         actions[0] = action.astype(np.float32)
@@ -138,9 +139,9 @@ def main():
             while angle_diff < -np.pi: angle_diff += 2 * np.pi
 
             if abs(angle_diff) > 0.3:
-                action = np.array([0.0, np.clip(angle_diff * 2, -1, 1), 0])
+                action = np.array([0.0, np.clip(angle_diff * 2, -1.57, 1.57), 0])
             else:
-                action = np.array([1.0, angle_diff * 0.5, 0])
+                action = np.array([2.0, angle_diff * 0.5, 0])  # max speed
 
             actions = {i: np.zeros(3, dtype=np.float32) for i in range(8)}
             actions[0] = action.astype(np.float32)

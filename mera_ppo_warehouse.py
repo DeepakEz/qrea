@@ -190,6 +190,11 @@ class PPOActorCritic(nn.Module):
         if encoder_type == "mera":
             self.phi_q_value_weight = nn.Parameter(torch.tensor(0.1))
 
+        # Action scaling bounds (from warehouse_env action space)
+        # [linear_vel, angular_vel, gripper]
+        self.action_low = torch.tensor([-2.0, -1.57, 0.0])
+        self.action_high = torch.tensor([2.0, 1.57, 1.0])
+
     def forward(self, obs_history: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         if self.encoder_type == "mlp":
             batch_size = obs_history.shape[0]
@@ -207,16 +212,29 @@ class PPOActorCritic(nn.Module):
 
         return action_mean, value, aux
 
+    def scale_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Scale action from [-1, 1] (tanh output) to action space bounds"""
+        low = self.action_low.to(action.device)
+        high = self.action_high.to(action.device)
+        # tanh bounds to [-1, 1], then scale to [low, high]
+        scaled = low + (torch.tanh(action) + 1.0) / 2.0 * (high - low)
+        return scaled
+
     def get_action(self, obs_history: torch.Tensor, deterministic: bool = False):
         action_mean, value, aux = self(obs_history)
         action_std = self.actor_log_std.exp().expand_as(action_mean)
         dist = Normal(action_mean, action_std)
 
-        action = action_mean if deterministic else dist.sample()
-        log_prob = dist.log_prob(action).sum(-1)
+        raw_action = action_mean if deterministic else dist.sample()
+        log_prob = dist.log_prob(raw_action).sum(-1)
+
+        # Scale action to environment bounds
+        scaled_action = self.scale_action(raw_action)
+
         phi_q = aux['phi_q'].mean().item() if aux['phi_q'] is not None else 0.0
 
-        return action, value, log_prob, phi_q, aux
+        # Return both: scaled for env, raw for PPO updates
+        return scaled_action, raw_action, value, log_prob, phi_q, aux
 
     def evaluate_actions(self, obs_history: torch.Tensor, actions: torch.Tensor):
         action_mean, value, aux = self(obs_history)
@@ -357,24 +375,25 @@ class MERAWarehousePPO:
             obs_batch = self._get_all_obs_tensors()
 
             with torch.no_grad():
-                actions, values, log_probs, phi_q, aux = self.network.get_action(obs_batch)
+                scaled_actions, raw_actions, values, log_probs, phi_q, aux = self.network.get_action(obs_batch)
 
-            actions_np = actions.cpu().numpy()
+            scaled_actions_np = scaled_actions.cpu().numpy()  # For env
+            raw_actions_np = raw_actions.cpu().numpy()  # For PPO updates
             values_np = values.cpu().numpy()
             log_probs_np = log_probs.cpu().numpy()
 
             episode_phi_q.append(phi_q)
             epoch_phi_q_values.append(phi_q)
 
-            # Execute in environment
-            actions_dict = {i: actions_np[i] for i in range(self.num_robots)}
+            # Execute in environment with SCALED actions
+            actions_dict = {i: scaled_actions_np[i] for i in range(self.num_robots)}
             next_obs, rewards, dones, info = self.env.step(actions_dict)
 
-            # Store transitions
+            # Store transitions (use RAW actions for PPO updates)
             for i in range(self.num_robots):
                 robot_transitions[i].append(Transition(
                     obs=np.stack(list(self.obs_history[i]), axis=0),
-                    action=actions_np[i],
+                    action=raw_actions_np[i],  # Store raw for evaluate_actions
                     reward=rewards[i],
                     done=dones[i],
                     value=values_np[i],
