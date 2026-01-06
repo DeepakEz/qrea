@@ -38,6 +38,7 @@ from collections import deque
 
 # Import existing infrastructure
 from warehouse_env import WarehouseEnv
+from warehouse_uprt import UPRTField
 from mera_enhanced import EnhancedMERAConfig, EnhancedTensorNetworkMERA, PhiQComputer
 from mera_rl_integration import (
     MERATrainingConfig,
@@ -255,18 +256,127 @@ class MERAEncoder(nn.Module):
         self.mera.set_step(step)
 
 
+class SpatioTemporalEncoder(nn.Module):
+    """Combined UPRT (spatial) + MERA (temporal) encoder.
+
+    Fixes the "split brain" problem by connecting:
+    - UPRT fields: spatial pattern fields (consciousness, resonance, genetic)
+    - MERA: temporal hierarchical encoding
+
+    The spatial features from UPRT fields are combined with MERA's temporal
+    latent to create a unified spatio-temporal representation.
+    """
+
+    def __init__(self, obs_dim: int, history_len: int, mera_config: EnhancedMERAConfig,
+                 config: dict, device: str = 'cpu'):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.history_len = history_len
+        self.device = device
+
+        # Temporal encoder (MERA)
+        self.mera_encoder = MERAEncoder(obs_dim, history_len, mera_config)
+        mera_dim = self.mera_encoder.output_dim
+
+        # Spatial encoder (UPRT field sampling)
+        self.uprt_field = UPRTField(config)
+        # UPRT fields: consciousness(16) + resonance(16) + genetic(32) = 64 channels
+        spatial_dim = 64
+
+        # Spatial feature projection
+        self.spatial_projection = nn.Sequential(
+            nn.Linear(spatial_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+        )
+        spatial_out_dim = 64
+
+        # Fusion layer: combine spatial + temporal
+        self.fusion = nn.Sequential(
+            nn.Linear(mera_dim + spatial_out_dim, mera_dim),
+            nn.ReLU(),
+            nn.Linear(mera_dim, mera_dim),
+        )
+
+        self.output_dim = mera_dim
+
+    def sample_field_at_position(self, position: torch.Tensor) -> torch.Tensor:
+        """Sample UPRT field values at robot position.
+
+        Args:
+            position: (batch, 2) robot positions in world coordinates
+
+        Returns:
+            field_features: (batch, 64) concatenated field values
+        """
+        batch_size = position.shape[0]
+
+        # Normalize position to field grid coordinates
+        grid_size = self.uprt_field.grid_resolution
+        normalized = position / 50.0  # Assuming 50x50 grid
+        grid_x = (normalized[:, 0] * (grid_size[0] - 1)).long().clamp(0, grid_size[0] - 1)
+        grid_y = (normalized[:, 1] * (grid_size[1] - 1)).long().clamp(0, grid_size[1] - 1)
+
+        # Sample from each field
+        consciousness = self.uprt_field.consciousness_field[grid_x, grid_y]  # (batch, 16)
+        resonance = self.uprt_field.resonance_field[grid_x, grid_y]  # (batch, 16)
+        genetic = self.uprt_field.genetic_field[grid_x, grid_y]  # (batch, 32)
+
+        return torch.cat([consciousness, resonance, genetic], dim=-1)  # (batch, 64)
+
+    def forward(self, obs_history: torch.Tensor,
+                robot_positions: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
+        """
+        Args:
+            obs_history: (batch, history_len, obs_dim)
+            robot_positions: (batch, 2) current robot positions for field sampling
+
+        Returns:
+            latent: (batch, output_dim), aux: Dict
+        """
+        # Temporal encoding via MERA
+        mera_latent, mera_aux = self.mera_encoder(obs_history)
+
+        # Spatial encoding via UPRT field sampling
+        if robot_positions is not None:
+            spatial_features = self.sample_field_at_position(robot_positions)
+            spatial_features = self.spatial_projection(spatial_features)
+
+            # Fuse spatial + temporal
+            combined = torch.cat([mera_latent, spatial_features], dim=-1)
+            latent = self.fusion(combined)
+        else:
+            latent = mera_latent
+
+        # Add spatial info to aux
+        mera_aux['spatial_integrated'] = robot_positions is not None
+
+        return latent, mera_aux
+
+    def set_step(self, step: int):
+        """Update step counter for warmup scheduling"""
+        self.mera_encoder.set_step(step)
+
+    def update_uprt_fields(self, robot_positions: torch.Tensor,
+                           robot_activities: torch.Tensor, dt: float = 0.1):
+        """Update UPRT field dynamics based on robot activity"""
+        self.uprt_field.update_fields(robot_positions, robot_activities, dt)
+
+
 class PPOActorCritic(nn.Module):
     """PPO Actor-Critic with multiple encoder options.
 
     Supported encoders:
     - mera: MERA tensor network (hierarchical, physics-inspired)
+    - mera_uprt: MERA + UPRT spatial fields (fixes split-brain problem)
     - gru: GRU recurrent baseline (standard temporal)
     - transformer: Transformer baseline (attention-based)
     - mlp: MLP baseline (no temporal structure)
     """
 
     def __init__(self, obs_dim: int, action_dim: int, history_len: int,
-                 encoder_type: str = "mera", mera_config: Optional[EnhancedMERAConfig] = None):
+                 encoder_type: str = "mera", mera_config: Optional[EnhancedMERAConfig] = None,
+                 config: Optional[dict] = None, device: str = 'cpu'):
         super().__init__()
         self.encoder_type = encoder_type
         self.action_dim = action_dim
@@ -281,6 +391,18 @@ class PPOActorCritic(nn.Module):
                     enforce_rg_fixed_point=True
                 )
             self.encoder = MERAEncoder(obs_dim, history_len, mera_config)
+            encoder_dim = self.encoder.output_dim
+        elif encoder_type == "mera_uprt":
+            # Combined spatio-temporal encoder: MERA (temporal) + UPRT (spatial)
+            if mera_config is None:
+                mera_config = EnhancedMERAConfig(
+                    num_layers=3, bond_dim=8, physical_dim=4,
+                    enable_phi_q=True, use_identity_init=True,
+                    enforce_rg_fixed_point=True
+                )
+            if config is None:
+                raise ValueError("config required for mera_uprt encoder")
+            self.encoder = SpatioTemporalEncoder(obs_dim, history_len, mera_config, config, device)
             encoder_dim = self.encoder.output_dim
         elif encoder_type == "gru":
             self.encoder = GRUEncoder(obs_dim, history_len, hidden_dim=256, num_layers=2)
@@ -429,10 +551,11 @@ class MERAWarehousePPO:
             rg_eigenvalue_weight=0.01,  # Reduced per experiment findings
         )
 
-        # Create network
+        # Create network (pass config for mera_uprt encoder)
         self.network = PPOActorCritic(
             self.obs_dim, self.action_dim, self.history_len,
-            encoder_type=encoder_type, mera_config=mera_config
+            encoder_type=encoder_type, mera_config=mera_config,
+            config=self.config, device=str(self.device)
         ).to(self.device)
 
         self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr)
@@ -822,8 +945,8 @@ def main():
     parser.add_argument('--config', type=str, default='config.yaml')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--encoder', type=str, default='mera',
-                        choices=['mera', 'gru', 'transformer', 'mlp'],
-                        help='Encoder type: mera (tensor network), gru (recurrent), transformer (attention), mlp (baseline)')
+                        choices=['mera', 'mera_uprt', 'gru', 'transformer', 'mlp'],
+                        help='Encoder type: mera (temporal), mera_uprt (spatial+temporal), gru, transformer, mlp')
     parser.add_argument('--quick_test', action='store_true')
     args = parser.parse_args()
 

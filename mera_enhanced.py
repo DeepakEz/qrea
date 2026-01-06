@@ -104,19 +104,19 @@ class TrueDisentangler(nn.Module):
         nn.init.orthogonal_(self.proj_right)
 
     def _unitary_init(self, d_in: int, d_out: int) -> torch.Tensor:
-        """Initialize tensor with approximate unitary structure"""
-        # Create random matrix and orthogonalize
-        flat = torch.randn(d_in * d_in, d_out * d_out)
-        u, s, vh = torch.linalg.svd(flat, full_matrices=False)
+        """
+        Initialize tensor with TRUE unitary structure using orthogonal init.
 
-        # Use left singular vectors (orthogonal columns)
-        k = min(d_in * d_in, d_out * d_out)
-        if d_in * d_in <= d_out * d_out:
-            result = u @ vh[:k, :]
-        else:
-            result = u[:, :k] @ vh
+        Ensures U†U = I to preserve signal magnitude through disentangling.
+        No scaling factor - must preserve norm exactly.
+        """
+        # Shape: (d_in * d_in, d_out * d_out) - treat as matrix
+        flat = torch.empty(d_in * d_in, d_out * d_out)
 
-        return result.reshape(d_in, d_in, d_out, d_out) * 0.5
+        # Use orthogonal initialization - singular values = 1
+        nn.init.orthogonal_(flat)
+
+        return flat.reshape(d_in, d_in, d_out, d_out)
 
     def forward(self, site1: torch.Tensor, site2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -177,41 +177,20 @@ class TrueIsometry(nn.Module):
 
     def _identity_based_init(self, d_in: int, d_out: int) -> torch.Tensor:
         """
-        Initialize near identity for stable RG flow.
+        Initialize with TRUE orthogonal structure for stable RG flow.
 
-        For RG fixed point, we want the isometry to approximately preserve
-        norm: ||w(s1, s2)|| ≈ ||s1|| + ||s2||. This is achieved by
-        initializing close to a "averaging" operation plus small noise.
+        Uses torch.nn.init.orthogonal_ to ensure W†W = I exactly at initialization.
+        This prevents signal vanishing through layers - critical for RG eigenvalues > 0.3.
         """
-        # Shape: (d_out, d_in, d_in)
-        tensor = torch.zeros(d_out, d_in, d_in)
+        # Shape: (d_out, d_in * d_in) - treat as matrix for orthogonal init
+        flat = torch.empty(d_out, d_in * d_in)
 
-        # For each output dimension, create a near-identity mapping
-        # that averages the two inputs (which preserves norm for RG flow)
-        min_dim = min(d_out, d_in)
-        for i in range(min_dim):
-            # Diagonal elements: average of corresponding input dimensions
-            # w[i, i, i] combines site1[i] and site2[i] into output[i]
-            tensor[i, i, i] = 1.0 / math.sqrt(2)  # Normalized averaging
+        # Use orthogonal initialization - ensures singular values = 1
+        # This guarantees W†W = I (for the smaller dimension)
+        nn.init.orthogonal_(flat)
 
-        # Add small noise for symmetry breaking
-        noise = torch.randn(d_out, d_in, d_in) * 0.1
-        tensor = tensor + noise
-
-        # Ensure isometry constraint approximately holds
-        # Re-orthogonalize using SVD
-        flat = tensor.reshape(d_out, d_in * d_in)
-        u, s, vh = torch.linalg.svd(flat, full_matrices=False)
-
-        # Scale singular values toward 1 (for isometry)
-        s_scaled = 0.7 * torch.ones_like(s) + 0.3 * s / (s.max() + 1e-6)
-
-        if d_out <= d_in * d_in:
-            result = u @ torch.diag(s_scaled) @ vh[:d_out, :]
-        else:
-            result = u @ torch.diag(s_scaled) @ vh
-
-        return result.reshape(d_out, d_in, d_in)
+        # Reshape back to tensor form
+        return flat.reshape(d_out, d_in, d_in)
 
     def _isometry_init(self, d_in: int, d_out: int) -> torch.Tensor:
         """Initialize with isometry structure: w†w = I (original method)"""
@@ -411,6 +390,16 @@ class MERAIntrinsicMotivation(nn.Module):
 
         phi_q_total = torch.stack(phi_q_values).mean(dim=0) if phi_q_values else torch.zeros(batch_size, device=device)
 
+        # Log-scale Φ_Q to make small values numerically significant
+        # Without this, Φ_Q ≈ 10^-5 is invisible to optimizer against reward ≈ 1.0
+        # log(10^-5) ≈ -11.5, log(10^-2) ≈ -4.6 → meaningful gradient signal
+        epsilon = 1e-8
+        phi_q_log = torch.log(phi_q_total + epsilon)
+
+        # Shift to positive range: add offset so typical values are > 0
+        # If phi_q ≈ 10^-5, log ≈ -11.5, shift by 15 → ~3.5
+        phi_q_scaled = phi_q_log + 15.0
+
         # Entanglement reward
         if len(layer_states[0]) > 1:
             entanglement = self.phi_q_computer.compute_entanglement_entropy(
@@ -427,10 +416,10 @@ class MERAIntrinsicMotivation(nn.Module):
             rg_novelty = torch.zeros(batch_size, device=device)
 
         if self.training:
-            self.update_statistics(phi_q_total.detach(), entanglement.detach())
+            self.update_statistics(phi_q_scaled.detach(), entanglement.detach())
 
-        # Normalize
-        phi_q_normalized = (phi_q_total - self.phi_q_mean) / (self.phi_q_std + 1e-8)
+        # Normalize the log-scaled Φ_Q
+        phi_q_normalized = (phi_q_scaled - self.phi_q_mean) / (self.phi_q_std + 1e-8)
         entanglement_normalized = (entanglement - self.entanglement_mean) / (self.entanglement_std + 1e-8)
 
         total_intrinsic = (
@@ -443,7 +432,8 @@ class MERAIntrinsicMotivation(nn.Module):
             'entanglement_reward': entanglement_normalized,
             'rg_novelty_reward': rg_novelty,
             'total_intrinsic': total_intrinsic,
-            'phi_q_raw': phi_q_total,
+            'phi_q_raw': phi_q_total,  # Original unscaled value
+            'phi_q_log_scaled': phi_q_scaled,  # Log-scaled value used for reward
             'entanglement_raw': entanglement,
         }
 
