@@ -83,7 +83,8 @@ def run_single_experiment(
     seed: int,
     epochs: int,
     num_robots: int = 8,
-    config_path: str = "config.yaml"
+    config_path: str = "config.yaml",
+    sparse_rewards: bool = False
 ) -> ExperimentResult:
     """Run a single experiment with given parameters"""
 
@@ -115,6 +116,9 @@ def run_single_experiment(
             "--encoder", encoder,
             "--epochs", str(epochs),
         ]
+
+        if sparse_rewards:
+            cmd.append("--sparse_rewards")
 
         # Capture output
         result = subprocess.run(
@@ -270,7 +274,8 @@ def run_encoder_comparison(
     seeds: int,
     epochs: int,
     num_robots: int = 8,
-    parallel: bool = True
+    parallel: bool = True,
+    sparse_rewards: bool = False
 ) -> Dict[str, AggregatedResults]:
     """Compare multiple encoders across seeds"""
 
@@ -283,7 +288,7 @@ def run_encoder_comparison(
         if parallel and seeds > 1:
             with ProcessPoolExecutor(max_workers=min(seeds, 4)) as executor:
                 futures = {
-                    executor.submit(run_single_experiment, encoder, seed, epochs, num_robots): seed
+                    executor.submit(run_single_experiment, encoder, seed, epochs, num_robots, "config.yaml", sparse_rewards): seed
                     for seed in range(seeds)
                 }
                 for future in as_completed(futures):
@@ -297,7 +302,7 @@ def run_encoder_comparison(
         else:
             for seed in range(seeds):
                 try:
-                    result = run_single_experiment(encoder, seed, epochs, num_robots)
+                    result = run_single_experiment(encoder, seed, epochs, num_robots, "config.yaml", sparse_rewards)
                     results.append(result)
                     print(f"  Seed {seed}: reward={result.final_reward:.2f}, delivered={result.packages_delivered}")
                 except Exception as e:
@@ -313,7 +318,8 @@ def run_scaling_study(
     encoder: str,
     robot_counts: List[int],
     seeds: int,
-    epochs: int
+    epochs: int,
+    sparse_rewards: bool = False
 ) -> Dict[str, AggregatedResults]:
     """Run scaling study across different robot counts"""
 
@@ -325,7 +331,7 @@ def run_scaling_study(
         results = []
         for seed in range(seeds):
             try:
-                result = run_single_experiment(encoder, seed, epochs, num_robots)
+                result = run_single_experiment(encoder, seed, epochs, num_robots, "config.yaml", sparse_rewards)
                 results.append(result)
                 print(f"  Seed {seed}: reward={result.final_reward:.2f}, throughput={result.throughput:.2f}")
             except Exception as e:
@@ -357,6 +363,8 @@ def main():
                         help='Run scaling study (4, 8, 16, 32 robots)')
     parser.add_argument('--parallel', action='store_true', default=True,
                         help='Run seeds in parallel')
+    parser.add_argument('--sparse_rewards', action='store_true',
+                        help='Use sparse rewards (stops reward hacking)')
     parser.add_argument('--output', type=str, default='experiment_results.json',
                         help='Output file for results')
 
@@ -381,7 +389,7 @@ def main():
 
         print(f"Comparing encoders: {encoders}")
         results = run_encoder_comparison(
-            encoders, args.seeds, args.epochs, args.robots, args.parallel
+            encoders, args.seeds, args.epochs, args.robots, args.parallel, args.sparse_rewards
         )
 
     elif args.scaling:
@@ -389,7 +397,7 @@ def main():
         robot_counts = [4, 8, 16, 32]
         print(f"Scaling study with {args.encoder}: {robot_counts} robots")
         results = run_scaling_study(
-            args.encoder, robot_counts, args.seeds, args.epochs
+            args.encoder, robot_counts, args.seeds, args.epochs, args.sparse_rewards
         )
 
     else:
@@ -399,7 +407,7 @@ def main():
         for seed in range(args.seeds):
             try:
                 result = run_single_experiment(
-                    args.encoder, seed, args.epochs, args.robots
+                    args.encoder, seed, args.epochs, args.robots, "config.yaml", args.sparse_rewards
                 )
                 exp_results.append(result)
                 print(f"Seed {seed}: reward={result.final_reward:.2f}")
