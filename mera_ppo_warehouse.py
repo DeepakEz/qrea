@@ -508,6 +508,12 @@ class PPOActorCritic(nn.Module):
         if self.encoder_type == "mera" and hasattr(self.encoder, 'set_step'):
             self.encoder.set_step(step)
 
+    def update_uprt_fields(self, robot_positions: torch.Tensor,
+                           robot_activities: torch.Tensor, dt: float = 0.1):
+        """Update UPRT field dynamics based on robot activity (mera_uprt only)"""
+        if self.encoder_type == "mera_uprt" and hasattr(self.encoder, 'update_uprt_fields'):
+            self.encoder.update_uprt_fields(robot_positions, robot_activities, dt)
+
 
 # =============================================================================
 # PPO Trainer with Warehouse Integration
@@ -766,6 +772,26 @@ class MERAWarehousePPO:
             # Execute in environment with SCALED actions
             actions_dict = {i: scaled_actions_np[i] for i in range(self.num_robots)}
             next_obs, rewards, dones, info = self.env.step(actions_dict)
+
+            # === UPDATE UPRT FIELDS (fix split-brain problem) ===
+            if self.encoder_type == 'mera_uprt':
+                uprt_positions = []
+                uprt_activities = []
+                for i in range(self.num_robots):
+                    if i in info:
+                        uprt_positions.append(info[i]['position'])
+                        # Create activity vector [velocity, carrying, noise...]
+                        act = np.zeros(64)
+                        vel = np.array(info[i].get('velocity', [0, 0]))
+                        act[0] = np.linalg.norm(vel)
+                        act[1] = 1.0 if info[i].get('carrying', False) else 0.0
+                        uprt_activities.append(act)
+
+                if uprt_positions:
+                    pos_tensor = torch.tensor(np.array(uprt_positions), device=self.device).float()
+                    act_tensor = torch.tensor(np.array(uprt_activities), device=self.device).float()
+                    self.network.update_uprt_fields(pos_tensor, act_tensor)
+            # =====================================================
 
             # Store transitions (use RAW actions for PPO updates)
             for i in range(self.num_robots):

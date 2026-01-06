@@ -328,7 +328,8 @@ class WarehouseEnv(gym.Env):
 
         # Auto-pickup: if very close to package and nearly stopped, try pickup
         # This teaches the agent that stopping near packages leads to pickup
-        if robot.speed < 0.5 and robot.carrying_package is None:
+        # Threshold 0.6 matches robot braking capabilities (brakes to ~0.5)
+        if robot.speed < 0.6 and robot.carrying_package is None:
             for pkg in self.packages:
                 if not pkg.is_delivered and pkg.assigned_robot is None:
                     dist = np.linalg.norm(robot.position - pkg.position)
@@ -407,8 +408,8 @@ class WarehouseEnv(gym.Env):
         if robot.carrying_package is not None:
             return  # Already carrying
 
-        # Robot must slow down to pickup (relaxed for learning)
-        if robot.speed > 1.0:  # Relaxed from 0.3 - still requires slowing down
+        # Robot must slow down to pickup (threshold matches braking capability)
+        if robot.speed > 0.6:  # Matches robot braking to ~0.5
             return
         
         # Find nearest unassigned package
