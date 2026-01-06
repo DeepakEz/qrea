@@ -210,12 +210,18 @@ class WarehouseEnv(gym.Env):
         
         # Reset robots
         self.robots = []
+        # Spawn robots in working zone (central area, reasonable distance to all stations)
+        center = self.grid_size / 2
+        spawn_radius = min(self.grid_size) * 0.3  # 30% of grid size
         for i in range(self.num_robots):
-            # Random spawn positions
+            # Spawn in circular zone around center
+            angle = 2 * np.pi * i / self.num_robots
+            r = spawn_radius * (0.5 + 0.5 * np.random.random())
             pos = np.array([
-                np.random.uniform(2, self.grid_size[0] - 2),
-                np.random.uniform(2, self.grid_size[1] - 2)
+                center[0] + r * np.cos(angle),
+                center[1] + r * np.sin(angle)
             ], dtype=np.float32)
+            pos = np.clip(pos, 2, self.grid_size - 2)
             
             self.robots.append(Robot(
                 id=i,

@@ -55,7 +55,7 @@ def main():
     print()
 
     reached = False
-    for step in range(150):
+    for step in range(400):  # Increased: need ~200 steps for 35m at 0.2m/step + rotation
         direction = pkg.position - robot.position
         dist = np.linalg.norm(direction)
 
@@ -71,10 +71,12 @@ def main():
         while angle_diff > np.pi: angle_diff -= 2 * np.pi
         while angle_diff < -np.pi: angle_diff += 2 * np.pi
 
-        if abs(angle_diff) > 0.3:
-            action = np.array([0.0, np.clip(angle_diff * 2, -1.57, 1.57), 0])  # rotate
-        else:
-            action = np.array([2.0, angle_diff * 0.5, 0])  # move forward at max speed
+        # Move while rotating (proportional control)
+        # Reduce speed when angle is off, but always move forward somewhat
+        angle_factor = max(0.3, 1.0 - abs(angle_diff) / np.pi)
+        linear_vel = 2.0 * angle_factor  # scale speed by alignment
+        angular_vel = np.clip(angle_diff * 2.0, -1.57, 1.57)
+        action = np.array([linear_vel, angular_vel, 0])
 
         actions = {i: np.zeros(3, dtype=np.float32) for i in range(8)}
         actions[0] = action.astype(np.float32)
@@ -138,10 +140,11 @@ def main():
             while angle_diff > np.pi: angle_diff -= 2 * np.pi
             while angle_diff < -np.pi: angle_diff += 2 * np.pi
 
-            if abs(angle_diff) > 0.3:
-                action = np.array([0.0, np.clip(angle_diff * 2, -1.57, 1.57), 0])
-            else:
-                action = np.array([2.0, angle_diff * 0.5, 0])  # max speed
+            # Move while rotating (proportional control)
+            angle_factor = max(0.3, 1.0 - abs(angle_diff) / np.pi)
+            linear_vel = 2.0 * angle_factor
+            angular_vel = np.clip(angle_diff * 2.0, -1.57, 1.57)
+            action = np.array([linear_vel, angular_vel, 0])
 
             actions = {i: np.zeros(3, dtype=np.float32) for i in range(8)}
             actions[0] = action.astype(np.float32)
