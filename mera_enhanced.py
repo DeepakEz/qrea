@@ -202,6 +202,9 @@ class TrueIsometry(nn.Module):
 
         Uses torch.nn.init.orthogonal_ to ensure W†W = I exactly at initialization.
         This prevents signal vanishing through layers - critical for RG eigenvalues > 0.3.
+
+        Added noise (0.3) to break symmetry and enable Φ_Q computation.
+        Without noise, identity init = zero entanglement = Φ_Q stays at 0.
         """
         # Shape: (d_out, d_in * d_in) - treat as matrix for orthogonal init
         flat = torch.empty(d_out, d_in * d_in)
@@ -209,6 +212,11 @@ class TrueIsometry(nn.Module):
         # Use orthogonal initialization - ensures singular values = 1
         # This guarantees W†W = I (for the smaller dimension)
         nn.init.orthogonal_(flat)
+
+        # Add noise to break symmetry and enable entanglement/Φ_Q
+        # Without this, pure identity init means zero entanglement
+        noise = torch.randn(d_out, d_in * d_in) * 0.3
+        flat = flat + noise
 
         # Reshape back to tensor form
         return flat.reshape(d_out, d_in, d_in)
