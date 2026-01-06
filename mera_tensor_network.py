@@ -166,25 +166,30 @@ class CausalMask:
         
     def _build_mask(self) -> torch.Tensor:
         """
-        Build the causal mask tensor.
-        
+        Build the causal mask tensor using vectorized operations.
+
         Returns:
             (temporal_window, temporal_window, spatial_size, spatial_size) boolean mask
         """
-        mask = torch.zeros(self.temporal_window, self.temporal_window, 
-                          self.spatial_size, self.spatial_size, dtype=torch.bool)
-        
-        for t in range(self.temporal_window):
-            for tau in range(self.temporal_window):
-                if t >= tau:  # Causality: future can only see past
-                    time_diff = t - tau
-                    for i in range(self.spatial_size):
-                        for j in range(self.spatial_size):
-                            spatial_dist = abs(i - j)
-                            # Within light cone if spatial distance < v_E * time
-                            if spatial_dist <= self.v_E * time_diff:
-                                mask[t, tau, i, j] = True
-                                
+        T, N = self.temporal_window, self.spatial_size
+
+        # Create grids for vectorized computation
+        t_grid = torch.arange(T).view(T, 1, 1, 1).expand(T, T, N, N)
+        tau_grid = torch.arange(T).view(1, T, 1, 1).expand(T, T, N, N)
+        i_grid = torch.arange(N).view(1, 1, N, 1).expand(T, T, N, N)
+        j_grid = torch.arange(N).view(1, 1, 1, N).expand(T, T, N, N)
+
+        # Causality: t >= tau (future can only see past)
+        time_diff = t_grid - tau_grid
+        causal = time_diff >= 0
+
+        # Spatial distance within light cone: |i - j| <= v_E * (t - tau)
+        spatial_dist = torch.abs(i_grid - j_grid)
+        within_cone = spatial_dist <= self.v_E * time_diff
+
+        # Combine conditions
+        mask = causal & within_cone
+
         return mask
     
     def apply(self, tensor: torch.Tensor) -> torch.Tensor:
