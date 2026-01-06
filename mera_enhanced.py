@@ -307,31 +307,64 @@ class PhiQComputer(nn.Module):
 
         return entropy
 
-    def forward(self, sites: List[torch.Tensor]) -> torch.Tensor:
-        """
-        Compute Φ_Q = S_whole - (S_left + S_right)
-
-        Positive Φ_Q indicates information integration beyond parts.
-        """
-        if len(sites) < self.min_sites:
+    def compute_phi_for_partition(self, sites: List[torch.Tensor],
+                                    partition_idx: int) -> torch.Tensor:
+        """Compute Φ for a specific partition point."""
+        if partition_idx <= 0 or partition_idx >= len(sites):
             return torch.zeros(sites[0].shape[0], device=sites[0].device)
 
-        mid = len(sites) // 2
-
-        # Whole system entropy
-        S_whole = self.compute_entanglement_entropy(sites, mid)
+        # Whole system entropy at this partition
+        S_whole = self.compute_entanglement_entropy(sites, partition_idx)
 
         # Parts entropy
-        left_sites = sites[:mid]
-        right_sites = sites[mid:]
+        left_sites = sites[:partition_idx]
+        right_sites = sites[partition_idx:]
 
         S_left = self.compute_entanglement_entropy(left_sites, len(left_sites) // 2) \
                  if len(left_sites) > 1 else torch.zeros_like(S_whole)
         S_right = self.compute_entanglement_entropy(right_sites, len(right_sites) // 2) \
                   if len(right_sites) > 1 else torch.zeros_like(S_whole)
 
-        # Φ_Q: integration beyond parts
-        phi_q = S_whole - (S_left + S_right)
+        # Φ at this partition
+        return S_whole - (S_left + S_right)
+
+    def forward(self, sites: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Compute Φ_Q using Minimum Information Partition (MIP) approximation.
+
+        True IIT Φ requires finding the partition that minimizes integrated info.
+        We approximate by computing Φ over multiple partition points and taking
+        the minimum. This prevents artificially high Φ from arbitrary partitions.
+
+        Positive Φ_Q indicates genuine information integration beyond parts.
+        """
+        if len(sites) < self.min_sites:
+            return torch.zeros(sites[0].shape[0], device=sites[0].device)
+
+        n = len(sites)
+
+        # Compute Φ over multiple partition points (MIP approximation)
+        # Use partitions at 1/4, 1/3, 1/2, 2/3, 3/4 of sequence
+        partition_points = []
+        for frac in [0.25, 0.33, 0.5, 0.67, 0.75]:
+            pt = int(n * frac)
+            if 0 < pt < n and pt not in partition_points:
+                partition_points.append(pt)
+
+        if not partition_points:
+            partition_points = [n // 2]
+
+        # Compute Φ at each partition
+        phi_values = []
+        for pt in partition_points:
+            phi = self.compute_phi_for_partition(sites, pt)
+            phi_values.append(phi)
+
+        # MIP: take minimum Φ across partitions
+        # This finds the "weakest link" - where integration is lowest
+        phi_stack = torch.stack(phi_values, dim=-1)  # (B, n_partitions)
+        phi_q = phi_stack.min(dim=-1)[0]  # (B,)
+
         return F.relu(phi_q)
 
 
@@ -611,10 +644,15 @@ class EnhancedTensorNetworkMERA(nn.Module):
     def compute_rg_eigenvalue_loss(self, sites_before: List[torch.Tensor],
                                     sites_after: List[torch.Tensor]) -> torch.Tensor:
         """
-        Compute loss to push RG eigenvalues toward fixed point (λ = 1).
+        Compute RG eigenvalue loss - penalize EXTREME values only.
 
-        At an RG fixed point, the coarse-graining transformation preserves
-        the norm ratio: ||w(s1, s2)|| / (||s1|| + ||s2||) ≈ 1
+        In physics MERA:
+        - λ > 1: relevant operators (important low-level features)
+        - λ = 1: marginal operators (scale-invariant)
+        - λ < 1: irrelevant operators (noise)
+
+        We allow eigenvalues to vary naturally, only penalizing extremes
+        (λ > 2.0 or λ < 0.3) to prevent instability.
 
         Applies warmup: loss is scaled from 0 to full weight over rg_loss_warmup_steps.
         """
@@ -626,32 +664,42 @@ class EnhancedTensorNetworkMERA(nn.Module):
         if not eigenvalues:
             return torch.tensor(0.0, device=next(self.parameters()).device)
 
-        # Loss: sum of (λ - target)²
-        target = self.config.rg_target_eigenvalue
-        loss = torch.tensor(0.0, device=eigenvalues[0].device)
-        for ev in eigenvalues:
-            loss = loss + (ev - target) ** 2
+        # Stack eigenvalues for efficient computation (fixes gradient accumulation)
+        ev_tensor = torch.stack(eigenvalues)
+
+        # Penalize extremes only: λ > 2.0 or λ < 0.3
+        # This allows relevant (λ>1) and irrelevant (λ<1) operators to emerge naturally
+        upper_violation = F.relu(ev_tensor - 2.0)  # Penalize λ > 2.0
+        lower_violation = F.relu(0.3 - ev_tensor)  # Penalize λ < 0.3
+        loss = (upper_violation ** 2 + lower_violation ** 2).mean()
 
         # Apply warmup factor
         warmup_factor = self.get_warmup_factor(self.config.rg_loss_warmup_steps)
 
-        return loss * self.config.rg_eigenvalue_weight * warmup_factor / len(eigenvalues)
+        return loss * self.config.rg_eigenvalue_weight * warmup_factor
 
     def compute_constraint_loss(self) -> torch.Tensor:
-        """Total constraint loss for unitarity and isometry"""
-        loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        """Total constraint loss for unitarity and isometry.
+
+        Fixed: Use list accumulation + sum for efficient gradient computation.
+        """
+        losses = []
+        device = next(self.parameters()).device
 
         if self.config.enforce_unitarity:
-            loss = loss + self.config.unitarity_weight * self.disentangler_0.unitarity_loss()
+            losses.append(self.config.unitarity_weight * self.disentangler_0.unitarity_loss())
             for dis in self.disentanglers:
-                loss = loss + self.config.unitarity_weight * dis.unitarity_loss()
+                losses.append(self.config.unitarity_weight * dis.unitarity_loss())
 
         if self.config.enforce_isometry:
-            loss = loss + self.config.isometry_weight * self.isometry_0.isometry_loss()
+            losses.append(self.config.isometry_weight * self.isometry_0.isometry_loss())
             for iso in self.isometries:
-                loss = loss + self.config.isometry_weight * iso.isometry_loss()
+                losses.append(self.config.isometry_weight * iso.isometry_loss())
 
-        return loss
+        if not losses:
+            return torch.tensor(0.0, device=device)
+
+        return torch.stack(losses).sum()
 
     def compute_scale_consistency_loss(self, layer_states: List[List[torch.Tensor]]) -> torch.Tensor:
         """Scale consistency across layers.
@@ -722,14 +770,23 @@ class EnhancedTensorNetworkMERA(nn.Module):
             rg_eigenvalue_loss = rg_eigenvalue_loss + self.compute_rg_eigenvalue_loss(sites_before, sites)
             layer_states.append(sites)
 
-        # Final latent
+        # Final latent - use fixed-size pooling to handle variable number of sites
+        # This fixes the "dimension explosion" issue where concat creates variable-length vectors
         if len(sites) > 0:
-            final_concat = torch.cat(sites, dim=-1)
+            sites_stack = torch.stack(sites, dim=1)  # (B, n_sites, bond_dim)
+            # Use both max and mean pooling for richer representation
+            max_pool = sites_stack.max(dim=1)[0]     # (B, bond_dim)
+            mean_pool = sites_stack.mean(dim=1)      # (B, bond_dim)
+            final_features = torch.cat([max_pool, mean_pool], dim=-1)  # (B, 2*bond_dim)
         else:
-            final_concat = layer_states[-2][0]
+            # Fallback to previous layer
+            sites_stack = torch.stack(layer_states[-2], dim=1)
+            max_pool = sites_stack.max(dim=1)[0]
+            mean_pool = sites_stack.mean(dim=1)
+            final_features = torch.cat([max_pool, mean_pool], dim=-1)
 
-        self._ensure_output_projection(final_concat.shape[-1], final_concat.device)
-        latent = self.output_projection(final_concat)
+        self._ensure_output_projection(final_features.shape[-1], final_features.device)
+        latent = self.output_projection(final_features)
 
         # Aggregate Φ_Q
         phi_q_total = torch.stack(phi_q_values).mean(dim=0) if phi_q_values else torch.zeros(

@@ -112,6 +112,115 @@ class MLPEncoder(nn.Module):
         return self.net(x), {'phi_q': torch.zeros(x.shape[0], device=x.device)}
 
 
+class GRUEncoder(nn.Module):
+    """GRU-based encoder baseline for temporal comparison.
+
+    Standard recurrent baseline to compare against MERA's hierarchical structure.
+    """
+
+    def __init__(self, obs_dim: int, history_len: int, hidden_dim: int = 256, num_layers: int = 2):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.history_len = history_len
+        self.hidden_dim = hidden_dim
+
+        # GRU for temporal processing
+        self.gru = nn.GRU(
+            input_size=obs_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.1 if num_layers > 1 else 0
+        )
+
+        # Output projection
+        self.output_projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.output_dim = hidden_dim
+
+    def forward(self, obs_history: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """
+        Args:
+            obs_history: (batch, history_len, obs_dim)
+        Returns:
+            latent: (batch, hidden_dim), aux: Dict
+        """
+        # GRU forward
+        gru_out, h_n = self.gru(obs_history)  # gru_out: (B, T, H), h_n: (num_layers, B, H)
+
+        # Use last hidden state
+        latent = h_n[-1]  # (B, H)
+        latent = self.output_projection(latent)
+
+        return latent, {'phi_q': torch.zeros(obs_history.shape[0], device=obs_history.device)}
+
+
+class TransformerEncoder(nn.Module):
+    """Transformer-based encoder baseline for temporal comparison.
+
+    Modern attention-based baseline to compare against MERA.
+    Tests whether MERA's hierarchical structure provides benefits over attention.
+    """
+
+    def __init__(self, obs_dim: int, history_len: int, d_model: int = 128,
+                 nhead: int = 4, num_layers: int = 2, dim_feedforward: int = 256):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.history_len = history_len
+        self.d_model = d_model
+
+        # Input projection
+        self.input_projection = nn.Linear(obs_dim, d_model)
+
+        # Positional encoding
+        self.pos_embedding = nn.Parameter(torch.randn(1, history_len, d_model) * 0.02)
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Output projection
+        self.output_projection = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.output_dim = d_model
+
+    def forward(self, obs_history: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """
+        Args:
+            obs_history: (batch, history_len, obs_dim)
+        Returns:
+            latent: (batch, d_model), aux: Dict
+        """
+        batch_size, seq_len, _ = obs_history.shape
+
+        # Project input
+        x = self.input_projection(obs_history)  # (B, T, d_model)
+
+        # Add positional encoding (handle variable sequence lengths)
+        x = x + self.pos_embedding[:, :seq_len, :]
+
+        # Transformer forward
+        x = self.transformer(x)  # (B, T, d_model)
+
+        # Mean pool over sequence (could also use CLS token)
+        latent = x.mean(dim=1)  # (B, d_model)
+        latent = self.output_projection(latent)
+
+        return latent, {'phi_q': torch.zeros(batch_size, device=obs_history.device)}
+
+
 class MERAEncoder(nn.Module):
     """MERA-based encoder that processes observation history"""
 
@@ -147,7 +256,14 @@ class MERAEncoder(nn.Module):
 
 
 class PPOActorCritic(nn.Module):
-    """PPO Actor-Critic with MERA or MLP encoder"""
+    """PPO Actor-Critic with multiple encoder options.
+
+    Supported encoders:
+    - mera: MERA tensor network (hierarchical, physics-inspired)
+    - gru: GRU recurrent baseline (standard temporal)
+    - transformer: Transformer baseline (attention-based)
+    - mlp: MLP baseline (no temporal structure)
+    """
 
     def __init__(self, obs_dim: int, action_dim: int, history_len: int,
                  encoder_type: str = "mera", mera_config: Optional[EnhancedMERAConfig] = None):
@@ -156,7 +272,7 @@ class PPOActorCritic(nn.Module):
         self.action_dim = action_dim
         self.history_len = history_len
 
-        # Create encoder
+        # Create encoder based on type
         if encoder_type == "mera":
             if mera_config is None:
                 mera_config = EnhancedMERAConfig(
@@ -166,7 +282,13 @@ class PPOActorCritic(nn.Module):
                 )
             self.encoder = MERAEncoder(obs_dim, history_len, mera_config)
             encoder_dim = self.encoder.output_dim
-        else:
+        elif encoder_type == "gru":
+            self.encoder = GRUEncoder(obs_dim, history_len, hidden_dim=256, num_layers=2)
+            encoder_dim = self.encoder.output_dim
+        elif encoder_type == "transformer":
+            self.encoder = TransformerEncoder(obs_dim, history_len, d_model=128, nhead=4, num_layers=2)
+            encoder_dim = self.encoder.output_dim
+        else:  # mlp
             flat_dim = obs_dim * history_len
             self.encoder = MLPEncoder(flat_dim, 256)
             encoder_dim = 256
@@ -699,7 +821,9 @@ def main():
     parser = argparse.ArgumentParser(description="MERA-PPO Warehouse Training")
     parser.add_argument('--config', type=str, default='config.yaml')
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--encoder', type=str, default='mera', choices=['mera', 'mlp'])
+    parser.add_argument('--encoder', type=str, default='mera',
+                        choices=['mera', 'gru', 'transformer', 'mlp'],
+                        help='Encoder type: mera (tensor network), gru (recurrent), transformer (attention), mlp (baseline)')
     parser.add_argument('--quick_test', action='store_true')
     args = parser.parse_args()
 

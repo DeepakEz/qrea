@@ -151,6 +151,11 @@ class WarehouseEnv(gym.Env):
         self.package_spawn_zones: Optional[List[Dict]] = None  # Clustered spawning
         self.dynamic_priorities: bool = False  # Dynamic priority changes
 
+        # Reward configuration
+        # sparse_rewards=True: Only reward delivery/pickup, high collision penalty (harder, more meaningful)
+        # sparse_rewards=False: Dense progress shaping (easier, for initial learning)
+        self.sparse_rewards: bool = False
+
         # Spaces
         self.action_space = self._create_action_space()
         self.observation_space = self._create_observation_space()
@@ -630,66 +635,64 @@ class WarehouseEnv(gym.Env):
     def _calculate_rewards(self) -> Dict[int, float]:
         """Calculate rewards for each robot.
 
-        Reward structure designed to guide learning:
-        - Large reward for delivery (main objective)
-        - Medium reward for pickup (critical milestone)
-        - Progress reward for moving toward goal (shaping)
-        - Small collision penalty (don't dominate learning)
+        Two modes:
+        - sparse_rewards=False (default): Dense shaping for easier learning
+        - sparse_rewards=True: Sparse rewards for meaningful evaluation
+
+        Dense mode guides learning but may hide coordination benefits.
+        Sparse mode is harder but better shows if MERA helps coordination.
         """
         rewards = {}
 
         for robot in self.robots:
             reward = 0.0
 
-            # === DELIVERY REWARD (main objective) ===
+            # === DELIVERY REWARD (main objective) - always applied ===
             if robot.carrying_package is not None:
                 pkg = self._get_package(robot.carrying_package)
                 if pkg and pkg.is_delivered:
                     reward += pkg.reward  # +100/200/300
 
-            # === PICKUP REWARD (critical milestone) ===
+            # === PICKUP REWARD (critical milestone) - always applied ===
             if robot.carrying_package is not None:
                 pkg = self._get_package(robot.carrying_package)
                 if pkg and pkg.pickup_time is not None:
                     time_since_pickup = self.current_step * self.dt - pkg.pickup_time
                     if time_since_pickup < 0.2:  # just picked up
-                        reward += 10.0  # Increased from 5.0
+                        reward += 10.0 if not self.sparse_rewards else 20.0
 
-            # === PROGRESS REWARDS (shaping) ===
-            if robot.carrying_package is not None:
-                # Carrying package: reward for moving toward destination
-                pkg = self._get_package(robot.carrying_package)
-                if pkg and not pkg.is_delivered:
-                    dist_to_dest = np.linalg.norm(robot.position - pkg.destination)
-                    # Reward inversely proportional to distance (closer = better)
-                    # Max grid is ~50x50, so max dist is ~70. Normalize.
-                    progress_reward = 2.0 * (1.0 - dist_to_dest / 70.0)
-                    reward += max(0, progress_reward)
-            else:
-                # Not carrying: reward for approaching packages
-                nearest_pkg_dist = float('inf')
-                for pkg in self.packages:
-                    if not pkg.is_delivered and pkg.assigned_robot is None:
-                        dist = np.linalg.norm(robot.position - pkg.position)
-                        if dist < nearest_pkg_dist:
-                            nearest_pkg_dist = dist
-
-                if nearest_pkg_dist < float('inf'):
-                    # Reward for being close to packages (up to +1.0)
-                    progress_reward = 1.0 * (1.0 - min(nearest_pkg_dist, 20.0) / 20.0)
-                    reward += progress_reward
-
-            # === PENALTIES (reduced to not dominate) ===
-            # Collision penalty (reduced from -10.0)
+            # === COLLISION PENALTY - always applied ===
             if robot.collision_count > 0:
-                reward -= 2.0 * robot.collision_count
+                # Sparse mode: higher penalty to force coordination
+                penalty = 50.0 if self.sparse_rewards else 2.0
+                reward -= penalty * robot.collision_count
                 robot.collision_count = 0
 
-            # No energy penalty - was discouraging movement
+            # === DENSE SHAPING (only in dense mode) ===
+            if not self.sparse_rewards:
+                if robot.carrying_package is not None:
+                    # Carrying package: reward for moving toward destination
+                    pkg = self._get_package(robot.carrying_package)
+                    if pkg and not pkg.is_delivered:
+                        dist_to_dest = np.linalg.norm(robot.position - pkg.destination)
+                        progress_reward = 2.0 * (1.0 - dist_to_dest / 70.0)
+                        reward += max(0, progress_reward)
+                else:
+                    # Not carrying: reward for approaching packages
+                    nearest_pkg_dist = float('inf')
+                    for pkg in self.packages:
+                        if not pkg.is_delivered and pkg.assigned_robot is None:
+                            dist = np.linalg.norm(robot.position - pkg.position)
+                            if dist < nearest_pkg_dist:
+                                nearest_pkg_dist = dist
 
-            # Low battery penalty (keep this for realism)
-            if robot.battery < 0.2 * self.battery_capacity:
-                reward -= 0.5
+                    if nearest_pkg_dist < float('inf'):
+                        progress_reward = 1.0 * (1.0 - min(nearest_pkg_dist, 20.0) / 20.0)
+                        reward += progress_reward
+
+                # Low battery penalty (only in dense mode)
+                if robot.battery < 0.2 * self.battery_capacity:
+                    reward -= 0.5
 
             rewards[robot.id] = reward
             self.episode_reward += reward
