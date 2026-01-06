@@ -278,7 +278,7 @@ class TransferExperiment:
 
             # Get actions
             with torch.no_grad():
-                actions, values, log_probs, phi_q, aux = network.get_action(obs_batch)
+                actions, _raw_actions, values, log_probs, phi_q, aux = network.get_action(obs_batch)
 
             actions_np = actions.cpu().numpy()
 
