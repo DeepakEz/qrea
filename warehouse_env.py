@@ -207,6 +207,7 @@ class WarehouseEnv(gym.Env):
         self.current_step = 0
         self.episode_reward = 0.0
         self.next_package_id = 0
+        self._just_delivered = {}  # Track deliveries for reward calculation
         
         # Reset robots
         self.robots = []
@@ -387,9 +388,12 @@ class WarehouseEnv(gym.Env):
                             robot.battery + self.charging_rate * self.dt,
                             self.battery_capacity
                         )
-    
+
     def _handle_packages(self):
         """Handle package pickup and delivery"""
+        # Track just-delivered packages for reward calculation
+        self._just_delivered = {}  # robot_id -> package_reward
+
         for robot in self.robots:
             if robot.carrying_package is not None:
                 pkg = self._get_package(robot.carrying_package)
@@ -398,6 +402,7 @@ class WarehouseEnv(gym.Env):
                     dist = np.linalg.norm(robot.position - pkg.destination)
                     if dist < 1.5:  # Within delivery range
                         pkg.delivery_time = self.current_step * self.dt
+                        self._just_delivered[robot.id] = pkg.reward  # Track for reward
                         robot.carrying_package = None
                         robot.packages_delivered += 1
                         self.stats['packages_delivered'] += 1
@@ -668,10 +673,9 @@ class WarehouseEnv(gym.Env):
             reward = 0.0
 
             # === DELIVERY REWARD (main objective) - always applied ===
-            if robot.carrying_package is not None:
-                pkg = self._get_package(robot.carrying_package)
-                if pkg and pkg.is_delivered:
-                    reward += pkg.reward  # +100/200/300
+            # Use _just_delivered tracking since carrying_package is cleared on delivery
+            if robot.id in self._just_delivered:
+                reward += self._just_delivered[robot.id]  # +100/200/300
 
             # === PICKUP REWARD (critical milestone) - always applied ===
             if robot.carrying_package is not None:
