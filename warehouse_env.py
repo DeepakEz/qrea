@@ -322,8 +322,21 @@ class WarehouseEnv(gym.Env):
         # Update angular velocity
         robot.angular_velocity = angular_vel
         
-        # Handle gripper
-        if gripper > 0.5:
+        # Handle gripper - also auto-trigger when very close and slow
+        # This helps agents learn that stopping near packages is good
+        should_try_pickup = gripper > 0.5
+
+        # Auto-pickup: if very close to package and nearly stopped, try pickup
+        # This teaches the agent that stopping near packages leads to pickup
+        if robot.speed < 0.5 and robot.carrying_package is None:
+            for pkg in self.packages:
+                if not pkg.is_delivered and pkg.assigned_robot is None:
+                    dist = np.linalg.norm(robot.position - pkg.position)
+                    if dist < 2.0:  # Very close
+                        should_try_pickup = True
+                        break
+
+        if should_try_pickup:
             self._try_pickup_or_deliver(robot)
     
     def _update_physics(self):
@@ -695,6 +708,15 @@ class WarehouseEnv(gym.Env):
                     if nearest_pkg_dist < float('inf'):
                         progress_reward = 1.0 * (1.0 - min(nearest_pkg_dist, 20.0) / 20.0)
                         reward += progress_reward
+
+                        # PRE-PICKUP REWARD: Being close AND slow (teaches pickup behavior)
+                        # This is critical - without this, agent never learns to slow down
+                        if nearest_pkg_dist < 3.0:  # Very close to package
+                            # Reward for slowing down (speed < 1.0 required for pickup)
+                            speed_factor = max(0, 1.0 - robot.speed)  # Higher when slower
+                            close_factor = 1.0 - nearest_pkg_dist / 3.0  # Higher when closer
+                            pre_pickup_reward = 3.0 * speed_factor * close_factor
+                            reward += pre_pickup_reward
 
                 # Low battery penalty (only in dense mode)
                 if robot.battery < 0.2 * self.battery_capacity:
