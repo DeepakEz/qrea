@@ -374,15 +374,19 @@ class MERAEnhancedTrainer:
         }
 
     def train_world_model(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Train world model with MERA encoder"""
+        """Train world model with MERA encoder using sliding windows.
+
+        Fixed: Use sliding window encoding instead of encoding full sequence once.
+        This preserves temporal locality - MERA encodes LOCAL history, not global.
+        """
         obs_seq = batch['obs']  # (B, T, obs_dim)
         action_seq = batch['action']  # (B, T, action_dim)
         reward_seq = batch['reward']  # (B, T, 1)
 
         batch_size, seq_len = obs_seq.shape[:2]
 
-        # Encode full sequence through MERA
-        mera_latent, mera_aux = self.world_model.encode_sequence(obs_seq)
+        # Sliding window size for MERA (local temporal context)
+        window_size = min(16, seq_len)
 
         # Initialize state
         state = self.world_model.initial_state(batch_size, self.device)
@@ -391,9 +395,20 @@ class MERAEnhancedTrainer:
         recon_loss = 0.0
         reward_loss = 0.0
         kl_loss = 0.0
+        all_mera_aux = []
 
         for t in range(seq_len - 1):
-            # Observe current step
+            # Sliding window: encode local history at each timestep
+            # This is the key fix - MERA should encode LOCAL context
+            window_start = max(0, t - window_size + 1)
+            window_end = t + 1
+            obs_window = obs_seq[:, window_start:window_end]  # (B, window_len, obs_dim)
+
+            # Encode local window through MERA
+            mera_latent, mera_aux = self.world_model.encode_sequence(obs_window)
+            all_mera_aux.append(mera_aux)
+
+            # Observe current step with LOCAL mera context
             state = self.world_model.observe(
                 obs_seq[:, t],
                 action_seq[:, t],
@@ -420,10 +435,24 @@ class MERAEnhancedTrainer:
         reward_loss /= (seq_len - 1)
         kl_loss /= (seq_len - 1)
 
-        # MERA-specific losses
-        mera_losses = self.world_model.get_mera_losses(mera_aux)
-        constraint_loss = mera_losses.get('constraint', torch.tensor(0.0))
-        scale_loss = mera_losses.get('scale_consistency', torch.tensor(0.0))
+        # Aggregate MERA-specific losses from all timesteps
+        constraint_losses = []
+        scale_losses = []
+        phi_q_values = []
+        intrinsic_rewards = []
+
+        for aux in all_mera_aux:
+            mera_losses = self.world_model.get_mera_losses(aux)
+            if 'constraint' in mera_losses:
+                constraint_losses.append(mera_losses['constraint'])
+            if 'scale_consistency' in mera_losses:
+                scale_losses.append(mera_losses['scale_consistency'])
+            if aux['phi_q'] is not None:
+                phi_q_values.append(aux['phi_q'].mean())
+            intrinsic_rewards.append(self.world_model.get_intrinsic_reward(aux).mean())
+
+        constraint_loss = torch.stack(constraint_losses).mean() if constraint_losses else torch.tensor(0.0, device=self.device)
+        scale_loss = torch.stack(scale_losses).mean() if scale_losses else torch.tensor(0.0, device=self.device)
 
         # Total loss
         total_loss = recon_loss + reward_loss + 0.1 * kl_loss + constraint_loss + scale_loss
@@ -434,8 +463,9 @@ class MERAEnhancedTrainer:
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), self.config.grad_clip)
         self.world_model_optimizer.step()
 
-        # Compute intrinsic reward for logging
-        intrinsic_reward = self.world_model.get_intrinsic_reward(mera_aux)
+        # Aggregate metrics
+        phi_q_mean = torch.stack(phi_q_values).mean().item() if phi_q_values else 0.0
+        intrinsic_reward_mean = torch.stack(intrinsic_rewards).mean().item() if intrinsic_rewards else 0.0
 
         metrics = {
             'recon_loss': recon_loss.item(),
@@ -443,8 +473,8 @@ class MERAEnhancedTrainer:
             'kl_loss': kl_loss.item(),
             'constraint_loss': constraint_loss.item() if torch.is_tensor(constraint_loss) else 0.0,
             'scale_loss': scale_loss.item() if torch.is_tensor(scale_loss) else 0.0,
-            'phi_q_mean': mera_aux['phi_q'].mean().item() if mera_aux['phi_q'] is not None else 0.0,
-            'intrinsic_reward_mean': intrinsic_reward.mean().item(),
+            'phi_q_mean': phi_q_mean,
+            'intrinsic_reward_mean': intrinsic_reward_mean,
             'total_loss': total_loss.item(),
         }
 

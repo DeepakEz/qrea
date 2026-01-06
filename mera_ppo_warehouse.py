@@ -112,6 +112,115 @@ class MLPEncoder(nn.Module):
         return self.net(x), {'phi_q': torch.zeros(x.shape[0], device=x.device)}
 
 
+class GRUEncoder(nn.Module):
+    """GRU-based encoder baseline for temporal comparison.
+
+    Standard recurrent baseline to compare against MERA's hierarchical structure.
+    """
+
+    def __init__(self, obs_dim: int, history_len: int, hidden_dim: int = 256, num_layers: int = 2):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.history_len = history_len
+        self.hidden_dim = hidden_dim
+
+        # GRU for temporal processing
+        self.gru = nn.GRU(
+            input_size=obs_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.1 if num_layers > 1 else 0
+        )
+
+        # Output projection
+        self.output_projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.output_dim = hidden_dim
+
+    def forward(self, obs_history: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """
+        Args:
+            obs_history: (batch, history_len, obs_dim)
+        Returns:
+            latent: (batch, hidden_dim), aux: Dict
+        """
+        # GRU forward
+        gru_out, h_n = self.gru(obs_history)  # gru_out: (B, T, H), h_n: (num_layers, B, H)
+
+        # Use last hidden state
+        latent = h_n[-1]  # (B, H)
+        latent = self.output_projection(latent)
+
+        return latent, {'phi_q': torch.zeros(obs_history.shape[0], device=obs_history.device)}
+
+
+class TransformerEncoder(nn.Module):
+    """Transformer-based encoder baseline for temporal comparison.
+
+    Modern attention-based baseline to compare against MERA.
+    Tests whether MERA's hierarchical structure provides benefits over attention.
+    """
+
+    def __init__(self, obs_dim: int, history_len: int, d_model: int = 128,
+                 nhead: int = 4, num_layers: int = 2, dim_feedforward: int = 256):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.history_len = history_len
+        self.d_model = d_model
+
+        # Input projection
+        self.input_projection = nn.Linear(obs_dim, d_model)
+
+        # Positional encoding
+        self.pos_embedding = nn.Parameter(torch.randn(1, history_len, d_model) * 0.02)
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Output projection
+        self.output_projection = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.output_dim = d_model
+
+    def forward(self, obs_history: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """
+        Args:
+            obs_history: (batch, history_len, obs_dim)
+        Returns:
+            latent: (batch, d_model), aux: Dict
+        """
+        batch_size, seq_len, _ = obs_history.shape
+
+        # Project input
+        x = self.input_projection(obs_history)  # (B, T, d_model)
+
+        # Add positional encoding (handle variable sequence lengths)
+        x = x + self.pos_embedding[:, :seq_len, :]
+
+        # Transformer forward
+        x = self.transformer(x)  # (B, T, d_model)
+
+        # Mean pool over sequence (could also use CLS token)
+        latent = x.mean(dim=1)  # (B, d_model)
+        latent = self.output_projection(latent)
+
+        return latent, {'phi_q': torch.zeros(batch_size, device=obs_history.device)}
+
+
 class MERAEncoder(nn.Module):
     """MERA-based encoder that processes observation history"""
 
@@ -147,7 +256,14 @@ class MERAEncoder(nn.Module):
 
 
 class PPOActorCritic(nn.Module):
-    """PPO Actor-Critic with MERA or MLP encoder"""
+    """PPO Actor-Critic with multiple encoder options.
+
+    Supported encoders:
+    - mera: MERA tensor network (hierarchical, physics-inspired)
+    - gru: GRU recurrent baseline (standard temporal)
+    - transformer: Transformer baseline (attention-based)
+    - mlp: MLP baseline (no temporal structure)
+    """
 
     def __init__(self, obs_dim: int, action_dim: int, history_len: int,
                  encoder_type: str = "mera", mera_config: Optional[EnhancedMERAConfig] = None):
@@ -156,7 +272,7 @@ class PPOActorCritic(nn.Module):
         self.action_dim = action_dim
         self.history_len = history_len
 
-        # Create encoder
+        # Create encoder based on type
         if encoder_type == "mera":
             if mera_config is None:
                 mera_config = EnhancedMERAConfig(
@@ -166,7 +282,13 @@ class PPOActorCritic(nn.Module):
                 )
             self.encoder = MERAEncoder(obs_dim, history_len, mera_config)
             encoder_dim = self.encoder.output_dim
-        else:
+        elif encoder_type == "gru":
+            self.encoder = GRUEncoder(obs_dim, history_len, hidden_dim=256, num_layers=2)
+            encoder_dim = self.encoder.output_dim
+        elif encoder_type == "transformer":
+            self.encoder = TransformerEncoder(obs_dim, history_len, d_model=128, nhead=4, num_layers=2)
+            encoder_dim = self.encoder.output_dim
+        else:  # mlp
             flat_dim = obs_dim * history_len
             self.encoder = MLPEncoder(flat_dim, 256)
             encoder_dim = 256
@@ -190,6 +312,11 @@ class PPOActorCritic(nn.Module):
         if encoder_type == "mera":
             self.phi_q_value_weight = nn.Parameter(torch.tensor(0.1))
 
+        # Action scaling bounds (from warehouse_env action space)
+        # [linear_vel, angular_vel, gripper]
+        self.action_low = torch.tensor([-2.0, -1.57, 0.0])
+        self.action_high = torch.tensor([2.0, 1.57, 1.0])
+
     def forward(self, obs_history: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         if self.encoder_type == "mlp":
             batch_size = obs_history.shape[0]
@@ -207,16 +334,29 @@ class PPOActorCritic(nn.Module):
 
         return action_mean, value, aux
 
+    def scale_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Scale action from [-1, 1] (tanh output) to action space bounds"""
+        low = self.action_low.to(action.device)
+        high = self.action_high.to(action.device)
+        # tanh bounds to [-1, 1], then scale to [low, high]
+        scaled = low + (torch.tanh(action) + 1.0) / 2.0 * (high - low)
+        return scaled
+
     def get_action(self, obs_history: torch.Tensor, deterministic: bool = False):
         action_mean, value, aux = self(obs_history)
         action_std = self.actor_log_std.exp().expand_as(action_mean)
         dist = Normal(action_mean, action_std)
 
-        action = action_mean if deterministic else dist.sample()
-        log_prob = dist.log_prob(action).sum(-1)
+        raw_action = action_mean if deterministic else dist.sample()
+        log_prob = dist.log_prob(raw_action).sum(-1)
+
+        # Scale action to environment bounds
+        scaled_action = self.scale_action(raw_action)
+
         phi_q = aux['phi_q'].mean().item() if aux['phi_q'] is not None else 0.0
 
-        return action, value, log_prob, phi_q, aux
+        # Return both: scaled for env, raw for PPO updates
+        return scaled_action, raw_action, value, log_prob, phi_q, aux
 
     def evaluate_actions(self, obs_history: torch.Tensor, actions: torch.Tensor):
         action_mean, value, aux = self(obs_history)
@@ -357,24 +497,25 @@ class MERAWarehousePPO:
             obs_batch = self._get_all_obs_tensors()
 
             with torch.no_grad():
-                actions, values, log_probs, phi_q, aux = self.network.get_action(obs_batch)
+                scaled_actions, raw_actions, values, log_probs, phi_q, aux = self.network.get_action(obs_batch)
 
-            actions_np = actions.cpu().numpy()
+            scaled_actions_np = scaled_actions.cpu().numpy()  # For env
+            raw_actions_np = raw_actions.cpu().numpy()  # For PPO updates
             values_np = values.cpu().numpy()
             log_probs_np = log_probs.cpu().numpy()
 
             episode_phi_q.append(phi_q)
             epoch_phi_q_values.append(phi_q)
 
-            # Execute in environment
-            actions_dict = {i: actions_np[i] for i in range(self.num_robots)}
+            # Execute in environment with SCALED actions
+            actions_dict = {i: scaled_actions_np[i] for i in range(self.num_robots)}
             next_obs, rewards, dones, info = self.env.step(actions_dict)
 
-            # Store transitions
+            # Store transitions (use RAW actions for PPO updates)
             for i in range(self.num_robots):
                 robot_transitions[i].append(Transition(
                     obs=np.stack(list(self.obs_history[i]), axis=0),
-                    action=actions_np[i],
+                    action=raw_actions_np[i],  # Store raw for evaluate_actions
                     reward=rewards[i],
                     done=dones[i],
                     value=values_np[i],
@@ -680,7 +821,9 @@ def main():
     parser = argparse.ArgumentParser(description="MERA-PPO Warehouse Training")
     parser.add_argument('--config', type=str, default='config.yaml')
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--encoder', type=str, default='mera', choices=['mera', 'mlp'])
+    parser.add_argument('--encoder', type=str, default='mera',
+                        choices=['mera', 'gru', 'transformer', 'mlp'],
+                        help='Encoder type: mera (tensor network), gru (recurrent), transformer (attention), mlp (baseline)')
     parser.add_argument('--quick_test', action='store_true')
     args = parser.parse_args()
 

@@ -77,29 +77,75 @@ class TransferConfig:
 
 
 class TaskVariant:
-    """Modifies warehouse environment for different tasks"""
+    """Modifies warehouse environment for different tasks.
+
+    Task variants for transfer learning experiments:
+    - uniform: Default package distribution (baseline)
+    - clustered: Packages spawn in clusters (spatial structure)
+    - dynamic: Package priorities change over time (temporal structure)
+    - sparse: Sparse rewards, high collision penalty (harder coordination)
+    - dense_traffic: More packages, faster spawn (throughput challenge)
+    - rush_hour: Reduced max_steps (time pressure)
+    """
 
     @staticmethod
     def apply_uniform(env: WarehouseEnv):
         """Uniform package distribution (default)"""
-        # No modification needed - this is the default
-        pass
+        # Reset to defaults
+        env.package_spawn_zones = None
+        env.dynamic_priorities = False
+        env.sparse_rewards = False
 
     @staticmethod
     def apply_clustered(env: WarehouseEnv):
         """Clustered package distribution - packages spawn in clusters"""
-        # Override package spawn locations to create clusters
-        if hasattr(env, 'package_spawn_zones'):
-            env.package_spawn_zones = [
-                {'center': [10, 10], 'radius': 5},  # Bottom-left cluster
-                {'center': [40, 40], 'radius': 5},  # Top-right cluster
-            ]
+        env.package_spawn_zones = [
+            {'center': [10, 10], 'radius': 5},  # Bottom-left cluster
+            {'center': [40, 40], 'radius': 5},  # Top-right cluster
+        ]
 
     @staticmethod
     def apply_dynamic(env: WarehouseEnv):
         """Dynamic priorities - package priorities change over time"""
-        if hasattr(env, 'dynamic_priorities'):
-            env.dynamic_priorities = True
+        env.dynamic_priorities = True
+
+    @staticmethod
+    def apply_sparse(env: WarehouseEnv):
+        """Sparse rewards mode - only delivery/pickup rewards, high collision penalty.
+
+        This is the HARD mode that truly tests coordination.
+        """
+        env.sparse_rewards = True
+
+    @staticmethod
+    def apply_dense_traffic(env: WarehouseEnv):
+        """Dense traffic - more packages, faster spawn rate.
+
+        Tests throughput under load.
+        """
+        env.num_packages = 150  # Increased from 100
+        env.package_spawn_rate = 2.0  # Faster spawning
+
+    @staticmethod
+    def apply_rush_hour(env: WarehouseEnv):
+        """Rush hour - reduced max steps (time pressure).
+
+        Tests efficient coordination under deadline.
+        """
+        env.max_steps = 300  # Reduced from 500
+
+    @staticmethod
+    def apply_combined_hard(env: WarehouseEnv):
+        """Combined hard mode - sparse rewards + clustered + rush hour.
+
+        Maximum difficulty for meaningful evaluation.
+        """
+        env.sparse_rewards = True
+        env.package_spawn_zones = [
+            {'center': [10, 10], 'radius': 5},
+            {'center': [40, 40], 'radius': 5},
+        ]
+        env.max_steps = 300
 
     @staticmethod
     def apply(task_name: str, env: WarehouseEnv):
@@ -107,9 +153,15 @@ class TaskVariant:
             'uniform': TaskVariant.apply_uniform,
             'clustered': TaskVariant.apply_clustered,
             'dynamic': TaskVariant.apply_dynamic,
+            'sparse': TaskVariant.apply_sparse,
+            'dense_traffic': TaskVariant.apply_dense_traffic,
+            'rush_hour': TaskVariant.apply_rush_hour,
+            'combined_hard': TaskVariant.apply_combined_hard,
         }
         if task_name in tasks:
             tasks[task_name](env)
+        else:
+            print(f"Warning: Unknown task variant '{task_name}'. Using uniform.")
 
 
 class TransferExperiment:
