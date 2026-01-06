@@ -1,24 +1,26 @@
 """
-MERA-PPO Warehouse Training
-============================
+MERA-PPO Warehouse Training (Paper Version)
+=============================================
 
-Integrates MERA tensor network with the existing warehouse environment
-to test if Φ_Q correlates with multi-agent coordination quality.
-
-This module uses:
-- warehouse_env.py: The actual multi-robot warehouse environment
-- config.yaml: Existing system configuration
-- mera_rl_integration.py: MERA world model integration
+Vanilla PPO + MERA encoder for ICLR submission.
+MERA provides hierarchical temporal encoding; Φ_Q is measured as a probe ONLY.
 
 Key Research Questions:
-1. Does higher Φ_Q during training correlate with better coordination?
-2. Do MERA-encoded policies learn faster than MLP baselines?
-3. Does the hierarchical structure help with multi-agent credit assignment?
+1. Does MERA's hierarchical structure improve sample efficiency vs baselines?
+2. Does higher Φ_Q correlate with better coordination (emergent property)?
+3. Can MERA representations transfer across robot counts?
+
+Encoders:
+- mera: MERA tensor network (hierarchical, physics-inspired)
+- mera_uprt: MERA + UPRT spatial fields
+- gru: GRU baseline
+- transformer: Transformer baseline
+- mlp: MLP baseline (no temporal structure)
 
 Usage:
-    python mera_ppo_warehouse.py --epochs 100
-    python mera_ppo_warehouse.py --baseline mlp  # Compare with MLP encoder
-    python mera_ppo_warehouse.py --quick_test    # 5 epoch test
+    python mera_ppo_warehouse.py --epochs 100 --encoder mera
+    python mera_ppo_warehouse.py --encoder mlp  # Baseline comparison
+    python mera_ppo_warehouse.py --robots 16    # Scaling study
 """
 
 import torch
@@ -40,26 +42,9 @@ from collections import deque
 from warehouse_env import WarehouseEnv
 from warehouse_uprt import UPRTField
 from mera_enhanced import EnhancedMERAConfig, EnhancedTensorNetworkMERA, PhiQComputer
-from mera_rl_integration import (
-    MERATrainingConfig,
-    MERAEnhancedWorldModel,
-    MERAEnhancedTrainer
-)
+# Note: mera_rl_integration contains MERAEnhancedWorldModel (unused in paper version)
 
-# Import GRFE, Evolution, and Safety modules
-from active_learning_grfe import (
-    GRFEFunctional,
-    GRFEComponents,
-    ActiveLearningController,
-    AgentMode
-)
-from evolutionary import EvolutionaryPopulation
-from safety_monitor import (
-    SafetyMonitor,
-    BarrierLyapunovFunction,
-    SafetyConstraint,
-    SafetyConstraintType
-)
+# Paper-core: vanilla PPO only - no GRFE, Evolution, or Safety modules
 
 
 # =============================================================================
@@ -523,8 +508,7 @@ class MERAWarehousePPO:
     """PPO trainer using existing WarehouseEnv and MERA integration"""
 
     def __init__(self, config_path: str = "config.yaml", encoder_type: str = "mera",
-                 num_epochs: int = 100, device: str = None, config_override: dict = None,
-                 use_evolution: bool = False, population_size: int = 8):
+                 num_epochs: int = 100, device: str = None, config_override: dict = None):
         # Load config (or use override)
         if config_override is not None:
             self.config = config_override
@@ -563,7 +547,6 @@ class MERAWarehousePPO:
         self.clip_epsilon = 0.2
         self.entropy_coef = learning_config['actor_critic']['entropy_weight']
         self.value_coef = 0.5
-        self.phi_q_intrinsic_weight = 0.1
 
         # MERA config
         mera_config = EnhancedMERAConfig(
@@ -602,103 +585,12 @@ class MERAWarehousePPO:
         self.epoch_phi_q = []
         self.epoch_steps = 0
 
-        # === GRFE Functional (v3.1 energy functional) ===
-        self.grfe = GRFEFunctional(
-            coherence_weight=0.5,
-            phi_q_weight=0.3,
-            novelty_weight=0.1,
-            empowerment_weight=0.2,
-            topological_weight=0.4,
-            entropy_weight=0.1
-        )
-        self.grfe_history = []
-
-        # === Active Learning Controller ===
-        self.active_learning = ActiveLearningController(
-            epistemic_threshold=0.3,
-            performance_threshold=0.5,
-            bootstrap_steps=100,
-            memory_size=50
-        )
-
-        # === Safety Monitor with Barrier Lyapunov Functions ===
-        safety_constraints = [
-            SafetyConstraint(
-                name="velocity",
-                constraint_type=SafetyConstraintType.VELOCITY,
-                min_value=-self.config['environment']['robot']['max_speed'],
-                max_value=self.config['environment']['robot']['max_speed']
-            ),
-            SafetyConstraint(
-                name="battery",
-                constraint_type=SafetyConstraintType.BATTERY,
-                min_value=0.1,  # Minimum 10% battery
-                max_value=1.0
-            ),
-            SafetyConstraint(
-                name="collision",
-                constraint_type=SafetyConstraintType.COLLISION,
-                min_value=0.5  # Minimum safe distance
-            )
-        ]
-        self.blf = BarrierLyapunovFunction(safety_constraints, self.device)
-        self.safety_violations = []
-
-        # === Evolutionary Population (optional) ===
-        self.use_evolution = use_evolution
-        self.evolution_population = None
-        if use_evolution:
-            # Create a simple agent wrapper for evolutionary population
-            class SimpleAgent:
-                def __init__(self, network, device):
-                    self.network = network
-                    self.device = device
-                    self.state = None
-
-                def reset(self):
-                    self.state = None
-
-                def act(self, obs):
-                    obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-                    with torch.no_grad():
-                        action_mean, _, _ = self.network(obs_tensor.unsqueeze(0))
-                        action = torch.tanh(action_mean[0]).cpu().numpy()
-                    return action
-
-                def get_networks(self):
-                    return {'policy': self.network}
-
-            base_agent = SimpleAgent(self.network, self.device)
-
-            # Add evolution config to main config if not present
-            if 'evolution' not in self.config:
-                self.config['evolution'] = {
-                    'population_size': population_size,
-                    'elite_size': max(2, population_size // 4),
-                    'crossover': {'rate': 0.5},
-                    'mutation': {'rate': 0.3, 'std': 0.1},
-                    'hgt': {'enabled': True, 'rate': 0.1},
-                    'inheritance': {
-                        'darwinian_weight': 0.5,
-                        'baldwinian_weight': 0.3,
-                        'lamarckian_weight': 0.2
-                    }
-                }
-
-            self.evolution_population = EvolutionaryPopulation(
-                base_agent, self.config, self.device
-            )
-            print(f"  Evolution: enabled (population={population_size})")
-
         # Output
         self.output_dir = Path(f"./results_{encoder_type}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"  Environment: max_steps={self.env.max_steps}, robots={self.num_robots}")
         print(f"  Steps per epoch: {self.steps_per_epoch}")
-        print(f"  GRFE functional: enabled")
-        print(f"  Active learning: enabled (threshold={self.active_learning.epistemic_threshold})")
-        print(f"  Safety BLF: enabled ({len(safety_constraints)} constraints)")
 
     def _reset_obs_history(self, observations: Dict[int, np.ndarray]):
         for robot_id, obs in observations.items():
@@ -737,29 +629,6 @@ class MERAWarehousePPO:
 
             with torch.no_grad():
                 scaled_actions, raw_actions, values, log_probs, phi_q, aux = self.network.get_action(obs_batch)
-
-            # === Active Learning Mode Control ===
-            # Check if we should switch to exploration based on uncertainty
-            epistemic_uncertainty = 0.0
-            if aux.get('phi_q') is not None:
-                # Use Φ_Q variance as proxy for epistemic uncertainty
-                epistemic_uncertainty = float(aux['phi_q'].std()) if aux['phi_q'].numel() > 1 else 0.1
-
-            recent_reward_avg = np.mean([t.reward for t in robot_transitions[0][-50:]]) if robot_transitions[0] else 0.0
-            regime_confidence = 1.0 - epistemic_uncertainty  # Simple proxy
-
-            agent_mode = self.active_learning.update(
-                epistemic_uncertainty=epistemic_uncertainty,
-                reward=float(episode_reward / max(episode_steps, 1)),
-                regime_confidence=regime_confidence
-            )
-
-            # In active learning mode, add exploration noise
-            if agent_mode == AgentMode.ACTIVE_LEARNING:
-                exploration_noise = torch.randn_like(scaled_actions) * 0.2
-                scaled_actions = scaled_actions + exploration_noise
-                # Re-clip to valid range
-                scaled_actions = torch.clamp(scaled_actions, -2.0, 2.0)
 
             scaled_actions_np = scaled_actions.cpu().numpy()  # For env
             raw_actions_np = raw_actions.cpu().numpy()  # For PPO updates
@@ -940,58 +809,17 @@ class MERAWarehousePPO:
                 value_loss = F.mse_loss(values, batch_returns)
                 entropy_loss = -entropy.mean()
 
-                # MERA losses
+                # MERA constraint losses (isometry, scale consistency)
+                # Note: Φ_Q is tracked as a probe only - does NOT affect optimization
                 if self.encoder_type in ["mera", "mera_uprt"]:
                     mera_loss = self.network.encoder.mera.get_total_loss(aux) if hasattr(self.network.encoder, 'mera') else \
                                self.network.encoder.mera_encoder.mera.get_total_loss(aux)
-                    phi_q_value = aux['phi_q'].mean() if aux['phi_q'] is not None else torch.tensor(0.0, device=self.device)
-                    phi_q_bonus = -self.phi_q_intrinsic_weight * phi_q_value
                 else:
                     mera_loss = 0.0
-                    phi_q_bonus = 0.0
-                    phi_q_value = torch.tensor(0.0, device=self.device)
 
-                # === GRFE Loss (Global Resonance Free Energy) ===
-                # Combines variational FE, coherence, Φ_Q, novelty, empowerment
-                grfe_loss = torch.tensor(0.0, device=self.device)
-                if self.encoder_type in ["mera", "mera_uprt"]:
-                    # Compute GRFE components
-                    # Use action distribution as predicted probs for variational term
-                    action_mean, _, _ = self.network(batch_obs)
-                    action_probs = torch.softmax(action_mean, dim=-1)  # Approximate probs
-
-                    grfe_total, grfe_components = self.grfe(
-                        predicted_probs=action_probs,
-                        true_labels=batch_actions[:, 0].long().clamp(0, action_probs.shape[-1]-1),  # Use linear vel as target
-                        phi_q=phi_q_value.unsqueeze(0) if phi_q_value.dim() == 0 else phi_q_value,
-                    )
-                    grfe_loss = 0.01 * grfe_total  # Scale GRFE contribution
-                    self.grfe_history.append(grfe_components)
-
-                # === Safety BLF Penalty ===
-                # Penalize states close to constraint boundaries
-                blf_penalty = torch.tensor(0.0, device=self.device)
-                # Extract safety-relevant features from observations
-                # obs structure: [robot_state(10) + lidar + packages + stations + others]
-                if batch_obs.shape[0] > 0:
-                    # Robot velocity is in first 10 elements (normalized)
-                    robot_velocities = batch_obs[:, 2:4]  # vx, vy in robot state
-                    velocity_magnitude = torch.norm(robot_velocities, dim=-1)
-
-                    # Battery is element 9 in robot state
-                    battery_levels = batch_obs[:, 9] if batch_obs.shape[-1] > 9 else torch.ones(batch_obs.shape[0], device=self.device)
-
-                    # Compute BLF for velocity and battery
-                    state_dict = {
-                        'velocity': velocity_magnitude,
-                        'battery': battery_levels.clamp(0.01, 1.0),  # Prevent log(0)
-                    }
-                    blf_value = self.blf.compute(state_dict)
-                    blf_penalty = 0.001 * blf_value.clamp(max=10.0)  # Clamp to prevent explosion
-
+                # Vanilla PPO loss: policy + value + entropy + MERA constraints
                 loss = (policy_loss + self.value_coef * value_loss +
-                       self.entropy_coef * entropy_loss + mera_loss + phi_q_bonus +
-                       grfe_loss + blf_penalty)
+                       self.entropy_coef * entropy_loss + mera_loss)
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -1154,10 +982,6 @@ def main():
                         help='Random seed for reproducibility')
     parser.add_argument('--sparse_rewards', action='store_true',
                         help='Use sparse rewards (delivery only, no shaping)')
-    parser.add_argument('--evolution', action='store_true',
-                        help='Enable evolutionary population training')
-    parser.add_argument('--population_size', type=int, default=8,
-                        help='Population size for evolutionary training')
     parser.add_argument('--quick_test', action='store_true')
     args = parser.parse_args()
 
@@ -1188,8 +1012,6 @@ def main():
         encoder_type=args.encoder,
         num_epochs=epochs,
         config_override=config_override,
-        use_evolution=args.evolution,
-        population_size=args.population_size,
     )
 
     results = trainer.train()

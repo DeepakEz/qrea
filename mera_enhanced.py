@@ -49,13 +49,9 @@ class EnhancedMERAConfig:
     rg_target_eigenvalue: float = 1.0   # Target RG eigenvalue (fixed point)
     rg_loss_warmup_steps: int = 1000    # Warmup before applying full RG loss
 
-    # Φ_Q computation
+    # Φ_Q computation (for analysis only - no gradients)
     enable_phi_q: bool = True
     phi_q_layers: List[int] = field(default_factory=lambda: [0, 1, 2])
-
-    # Intrinsic motivation
-    phi_q_intrinsic_weight: float = 0.1
-    entanglement_exploration_weight: float = 0.05
 
     # Scale consistency (reduced - was too restrictive per experiment findings)
     scale_consistency_weight: float = 0.001  # Was 0.1, hurting performance by -6.3%
@@ -537,8 +533,7 @@ class EnhancedTensorNetworkMERA(nn.Module):
         self.output_dim = config.bond_dim * 4
         self.output_projection = None
 
-        # Intrinsic motivation
-        self.intrinsic_motivation = MERAIntrinsicMotivation(config)
+        # Φ_Q computation (analysis probe only - no gradients)
         self.phi_q_computer = PhiQComputer()
 
         # Scale consistency
@@ -797,8 +792,10 @@ class EnhancedTensorNetworkMERA(nn.Module):
         rg_eigenvalue_loss = torch.tensor(0.0, device=sequence.device)
 
         # Layer 0: physical_dim → bond_dim
+        # Φ_Q computed without gradients - it's a probe/diagnostic only
         if self.config.enable_phi_q and 0 in self.config.phi_q_layers and len(sites) >= 2:
-            phi_q_values.append(self.phi_q_computer(sites))
+            with torch.no_grad():
+                phi_q_values.append(self.phi_q_computer(sites))
 
         sites_before = sites
         sites = self.apply_layer_0(sites)
@@ -815,7 +812,8 @@ class EnhancedTensorNetworkMERA(nn.Module):
                 break
 
             if self.config.enable_phi_q and (layer_idx + 1) in self.config.phi_q_layers and len(sites) >= 2:
-                phi_q_values.append(self.phi_q_computer(sites))
+                with torch.no_grad():
+                    phi_q_values.append(self.phi_q_computer(sites))
 
             sites_before = sites
             sites = self.apply_layer_n(sites, layer_idx)
@@ -855,23 +853,17 @@ class EnhancedTensorNetworkMERA(nn.Module):
             if len(self.rg_eigenvalues_history) > 100:
                 self.rg_eigenvalues_history.pop(0)
 
-        # Losses
+        # Losses (regularization for encoder)
         constraint_loss = self.compute_constraint_loss()
         scale_loss = self.compute_scale_consistency_loss(layer_states)
 
-        # Intrinsic rewards
-        intrinsic_rewards = self.intrinsic_motivation.compute_intrinsic_reward(
-            layer_states, all_rg_eigenvalues
-        )
-
         aux = {
-            'phi_q': phi_q_total,
+            'phi_q': phi_q_total.detach(),  # No gradients - probe only
             'layer_states': layer_states,
             'rg_eigenvalues': all_rg_eigenvalues,
             'constraint_loss': constraint_loss,
             'scale_consistency_loss': scale_loss,
             'rg_eigenvalue_loss': rg_eigenvalue_loss,
-            'intrinsic_rewards': intrinsic_rewards,
             'num_sites_per_layer': [len(states) for states in layer_states],
         }
 

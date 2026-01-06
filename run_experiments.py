@@ -28,7 +28,7 @@ import yaml
 
 @dataclass
 class ExperimentResult:
-    """Results from a single experiment run"""
+    """Results from a single experiment run (paper metrics only)"""
     seed: int
     encoder: str
     num_robots: int
@@ -37,17 +37,14 @@ class ExperimentResult:
     # Performance metrics
     final_reward: float
     avg_reward: float
-    max_reward: float
 
-    # Coordination metrics
+    # Coordination metrics (paper core)
     packages_delivered: int
-    collisions: int
+    collision_rate: float  # collisions per episode step
     throughput: float
 
-    # MERA-specific metrics (if applicable)
+    # Φ_Q metric (probe - not optimized)
     final_phi_q: float = 0.0
-    avg_phi_q: float = 0.0
-    rg_eigenvalue_mean: float = 0.0
 
     # Training time
     training_time_seconds: float = 0.0
@@ -55,7 +52,7 @@ class ExperimentResult:
 
 @dataclass
 class AggregatedResults:
-    """Aggregated results across seeds"""
+    """Aggregated results across seeds (paper metrics)"""
     encoder: str
     num_robots: int
     num_seeds: int
@@ -63,14 +60,16 @@ class AggregatedResults:
     # Mean +/- std for metrics
     final_reward_mean: float
     final_reward_std: float
-    avg_reward_mean: float
-    avg_reward_std: float
 
+    # Coordination metrics
     packages_delivered_mean: float
     packages_delivered_std: float
+    collision_rate_mean: float
+    collision_rate_std: float
     throughput_mean: float
     throughput_std: float
 
+    # Φ_Q (probe only)
     phi_q_mean: float = 0.0
     phi_q_std: float = 0.0
 
@@ -140,6 +139,11 @@ def run_single_experiment(
             # Parse from stdout
             data = parse_stdout(result.stdout)
 
+        # Compute collision_rate from collisions and episode length
+        collisions = data.get('collisions', 0)
+        episode_steps = data.get('episode_steps', epochs * 500)  # estimate
+        collision_rate = collisions / max(episode_steps, 1)
+
         return ExperimentResult(
             seed=seed,
             encoder=encoder,
@@ -147,13 +151,10 @@ def run_single_experiment(
             epochs=epochs,
             final_reward=data.get('final_reward', 0),
             avg_reward=data.get('avg_reward', 0),
-            max_reward=data.get('max_reward', 0),
             packages_delivered=data.get('packages_delivered', 0),
-            collisions=data.get('collisions', 0),
+            collision_rate=collision_rate,
             throughput=data.get('throughput', 0),
             final_phi_q=data.get('phi_q', 0),
-            avg_phi_q=data.get('avg_phi_q', 0),
-            rg_eigenvalue_mean=data.get('rg_eigenvalue_mean', 0),
             training_time_seconds=training_time
         )
 
@@ -223,8 +224,8 @@ def aggregate_results(results: List[ExperimentResult]) -> AggregatedResults:
     num_robots = results[0].num_robots
 
     final_rewards = [r.final_reward for r in results]
-    avg_rewards = [r.avg_reward for r in results]
     packages = [r.packages_delivered for r in results]
+    collision_rates = [r.collision_rate for r in results]
     throughputs = [r.throughput for r in results]
     phi_qs = [r.final_phi_q for r in results]
     times = [r.training_time_seconds for r in results]
@@ -235,10 +236,10 @@ def aggregate_results(results: List[ExperimentResult]) -> AggregatedResults:
         num_seeds=len(results),
         final_reward_mean=np.mean(final_rewards),
         final_reward_std=np.std(final_rewards),
-        avg_reward_mean=np.mean(avg_rewards),
-        avg_reward_std=np.std(avg_rewards),
         packages_delivered_mean=np.mean(packages),
         packages_delivered_std=np.std(packages),
+        collision_rate_mean=np.mean(collision_rates),
+        collision_rate_std=np.std(collision_rates),
         throughput_mean=np.mean(throughputs),
         throughput_std=np.std(throughputs),
         phi_q_mean=np.mean(phi_qs),
@@ -249,24 +250,25 @@ def aggregate_results(results: List[ExperimentResult]) -> AggregatedResults:
 
 
 def print_results_table(all_results: Dict[str, AggregatedResults]):
-    """Print nicely formatted results table"""
-    print("\n" + "=" * 80)
+    """Print nicely formatted results table (paper metrics)"""
+    print("\n" + "=" * 100)
     print("EXPERIMENT RESULTS (mean +/- std across seeds)")
-    print("=" * 80)
+    print("=" * 100)
 
     # Header
-    print(f"{'Encoder':<15} {'Robots':<8} {'Reward':<20} {'Delivered':<15} {'Throughput':<15} {'Phi_Q':<15}")
-    print("-" * 80)
+    print(f"{'Encoder':<12} {'Robots':<7} {'Reward':<18} {'Delivered':<12} {'Coll.Rate':<12} {'Throughput':<12} {'Phi_Q':<12}")
+    print("-" * 100)
 
     for key, agg in sorted(all_results.items()):
-        reward_str = f"{agg.final_reward_mean:.2f} +/- {agg.final_reward_std:.2f}"
-        delivered_str = f"{agg.packages_delivered_mean:.1f} +/- {agg.packages_delivered_std:.1f}"
-        throughput_str = f"{agg.throughput_mean:.2f} +/- {agg.throughput_std:.2f}"
-        phi_q_str = f"{agg.phi_q_mean:.4f} +/- {agg.phi_q_std:.4f}"
+        reward_str = f"{agg.final_reward_mean:.1f}±{agg.final_reward_std:.1f}"
+        delivered_str = f"{agg.packages_delivered_mean:.1f}±{agg.packages_delivered_std:.1f}"
+        coll_str = f"{agg.collision_rate_mean:.4f}±{agg.collision_rate_std:.4f}"
+        throughput_str = f"{agg.throughput_mean:.1f}±{agg.throughput_std:.1f}"
+        phi_q_str = f"{agg.phi_q_mean:.4f}±{agg.phi_q_std:.4f}"
 
-        print(f"{agg.encoder:<15} {agg.num_robots:<8} {reward_str:<20} {delivered_str:<15} {throughput_str:<15} {phi_q_str:<15}")
+        print(f"{agg.encoder:<12} {agg.num_robots:<7} {reward_str:<18} {delivered_str:<12} {coll_str:<12} {throughput_str:<12} {phi_q_str:<12}")
 
-    print("=" * 80)
+    print("=" * 100)
 
 
 def run_encoder_comparison(
