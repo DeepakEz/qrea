@@ -140,6 +140,27 @@ class TrueDisentangler(nn.Module):
 
         return out1, out2
 
+    def batch_forward(self, sites_even: torch.Tensor, sites_odd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Batched disentangler for processing multiple site pairs in parallel.
+
+        Args:
+            sites_even: (n_pairs, batch, d_in) - even-indexed sites
+            sites_odd: (n_pairs, batch, d_in) - odd-indexed sites
+
+        Returns:
+            out_even, out_odd: (n_pairs, batch, d_out) each
+        """
+        # Batched einsum: process all pairs at once
+        # Contract: u_{ijkl} × sites_even_{p,b,i} × sites_odd_{p,b,j} → combined_{p,b,k,l}
+        combined = torch.einsum('ijkl,pbi,pbj->pbkl', self.tensor, sites_even, sites_odd)
+
+        # Split using projections
+        out_even = torch.einsum('pbkl,kk->pbl', combined, self.proj_left)
+        out_odd = torch.einsum('pbkl,ll->pbk', combined, self.proj_right)
+
+        return out_even, out_odd
+
     def unitarity_loss(self) -> torch.Tensor:
         """Compute loss encouraging unitary structure"""
         # Reshape to matrix
@@ -224,6 +245,20 @@ class TrueIsometry(nn.Module):
         """
         # Contract: w_{α,i,j} × site1_i × site2_j → output_α
         return torch.einsum('aij,bi,bj->ba', self.tensor, site1, site2)
+
+    def batch_forward(self, sites_even: torch.Tensor, sites_odd: torch.Tensor) -> torch.Tensor:
+        """
+        Batched isometry for processing multiple site pairs in parallel.
+
+        Args:
+            sites_even: (n_pairs, batch, d_in) - even-indexed sites
+            sites_odd: (n_pairs, batch, d_in) - odd-indexed sites
+
+        Returns:
+            output: (n_pairs, batch, d_out)
+        """
+        # Batched einsum: w_{α,i,j} × sites_even_{p,b,i} × sites_odd_{p,b,j} → output_{p,b,α}
+        return torch.einsum('aij,pbi,pbj->pba', self.tensor, sites_even, sites_odd)
 
     def isometry_loss(self) -> torch.Tensor:
         """Compute loss for isometry constraint: w†w = I"""
@@ -573,27 +608,50 @@ class EnhancedTensorNetworkMERA(nn.Module):
         return coarse
 
     def apply_layer_n(self, sites: List[torch.Tensor], layer_idx: int) -> List[torch.Tensor]:
-        """Layers 1+: bond_dim → bond_dim"""
+        """Layers 1+: bond_dim → bond_dim (uses batched processing for efficiency)"""
         if len(sites) < 2:
             return sites
 
         disentangler = self.disentanglers[layer_idx]
         isometry = self.isometries[layer_idx]
 
-        # Disentangle
-        disentangled = []
-        for i in range(0, len(sites) - 1, 2):
-            s1, s2 = disentangler(sites[i], sites[i + 1])
-            disentangled.extend([s1, s2])
-        if len(sites) % 2 == 1:
+        # Batch disentangle: collect pairs and process together
+        n_pairs = len(sites) // 2
+        has_odd = len(sites) % 2 == 1
+
+        if n_pairs > 0:
+            # Stack even and odd sites for batched processing
+            sites_even = torch.stack([sites[2*i] for i in range(n_pairs)])     # (n_pairs, batch, d)
+            sites_odd = torch.stack([sites[2*i + 1] for i in range(n_pairs)])  # (n_pairs, batch, d)
+
+            # Batched disentangle
+            out_even, out_odd = disentangler.batch_forward(sites_even, sites_odd)
+
+            # Interleave results back
+            disentangled = []
+            for i in range(n_pairs):
+                disentangled.extend([out_even[i], out_odd[i]])
+        else:
+            disentangled = sites.copy()
+
+        if has_odd:
             disentangled.append(sites[-1])
 
-        # Coarse-grain
-        coarse = []
-        for i in range(0, len(disentangled) - 1, 2):
-            c = isometry(disentangled[i], disentangled[i + 1])
-            coarse.append(c)
-        if len(disentangled) % 2 == 1:
+        # Batch coarse-grain
+        n_coarse_pairs = len(disentangled) // 2
+        has_odd_coarse = len(disentangled) % 2 == 1
+
+        if n_coarse_pairs > 0:
+            dis_even = torch.stack([disentangled[2*i] for i in range(n_coarse_pairs)])
+            dis_odd = torch.stack([disentangled[2*i + 1] for i in range(n_coarse_pairs)])
+
+            # Batched isometry
+            coarse_stacked = isometry.batch_forward(dis_even, dis_odd)  # (n_pairs, batch, d_out)
+            coarse = [coarse_stacked[i] for i in range(n_coarse_pairs)]
+        else:
+            coarse = []
+
+        if has_odd_coarse:
             coarse.append(disentangled[-1])
 
         return coarse

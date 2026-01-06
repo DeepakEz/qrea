@@ -502,10 +502,13 @@ class MERAWarehousePPO:
     """PPO trainer using existing WarehouseEnv and MERA integration"""
 
     def __init__(self, config_path: str = "config.yaml", encoder_type: str = "mera",
-                 num_epochs: int = 100, device: str = None):
-        # Load config
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
+                 num_epochs: int = 100, device: str = None, config_override: dict = None):
+        # Load config (or use override)
+        if config_override is not None:
+            self.config = config_override
+        else:
+            with open(config_path, 'r') as f:
+                self.config = yaml.safe_load(f)
 
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.encoder_type = encoder_type
@@ -947,15 +950,42 @@ def main():
     parser.add_argument('--encoder', type=str, default='mera',
                         choices=['mera', 'mera_uprt', 'gru', 'transformer', 'mlp'],
                         help='Encoder type: mera (temporal), mera_uprt (spatial+temporal), gru, transformer, mlp')
+    parser.add_argument('--robots', type=int, default=None,
+                        help='Override number of robots (for scaling study: 4, 8, 16, 32)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed for reproducibility')
+    parser.add_argument('--sparse_rewards', action='store_true',
+                        help='Use sparse rewards (delivery only, no shaping)')
     parser.add_argument('--quick_test', action='store_true')
     args = parser.parse_args()
 
+    # Set seed if provided
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        print(f"Random seed: {args.seed}")
+
     epochs = 5 if args.quick_test else args.epochs
+
+    # Load and potentially modify config
+    config_override = None
+    if args.robots is not None or args.sparse_rewards:
+        with open(args.config, 'r') as f:
+            config_override = yaml.safe_load(f)
+
+        if args.robots is not None:
+            config_override['environment']['num_robots'] = args.robots
+            print(f"Overriding num_robots to {args.robots}")
+
+        if args.sparse_rewards:
+            config_override['environment']['sparse_rewards'] = True
+            print("Using sparse rewards")
 
     trainer = MERAWarehousePPO(
         config_path=args.config,
         encoder_type=args.encoder,
         num_epochs=epochs,
+        config_override=config_override,
     )
 
     results = trainer.train()
