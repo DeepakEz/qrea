@@ -710,7 +710,9 @@ class WarehouseEnv(gym.Env):
                                 nearest_pkg_dist = dist
 
                     if nearest_pkg_dist < float('inf'):
-                        progress_reward = 1.0 * (1.0 - min(nearest_pkg_dist, 20.0) / 20.0)
+                        # Use grid diagonal (~70m) as max distance for proper gradient
+                        max_dist = np.linalg.norm(self.grid_size)  # ~70m for 50x50 grid
+                        progress_reward = 1.0 * (1.0 - min(nearest_pkg_dist, max_dist) / max_dist)
                         reward += progress_reward
 
                         # PRE-PICKUP REWARD: Being close AND slow (teaches pickup behavior)
