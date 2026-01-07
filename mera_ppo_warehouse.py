@@ -828,23 +828,36 @@ class MERAWarehousePPO:
 
     def compute_phi_q_correlation(self) -> Dict:
         """Compute correlation between Φ_Q and coordination"""
-        if len(self.phi_q_vs_coordination) < 10:
-            return {'correlation': 0.0, 'num_samples': len(self.phi_q_vs_coordination)}
+        num_samples = len(self.phi_q_vs_coordination)
+
+        if num_samples < 2:
+            return {
+                'correlation': 0.0,
+                'phi_q_mean': 0.0,
+                'synergy_mean': 0.0,
+                'num_samples': num_samples,
+            }
 
         phi_q_vals = np.array([x[0] for x in self.phi_q_vs_coordination])
         synergy_vals = np.array([x[1] for x in self.phi_q_vs_coordination])
 
-        # Pearson correlation
-        phi_q_mean, synergy_mean = phi_q_vals.mean(), synergy_vals.mean()
-        numerator = np.sum((phi_q_vals - phi_q_mean) * (synergy_vals - synergy_mean))
-        denominator = (np.sqrt(np.sum((phi_q_vals - phi_q_mean) ** 2)) *
-                      np.sqrt(np.sum((synergy_vals - synergy_mean) ** 2)) + 1e-8)
+        phi_q_mean = float(phi_q_vals.mean())
+        synergy_mean = float(synergy_vals.mean())
+
+        # Pearson correlation (need enough samples for meaningful correlation)
+        if num_samples < 10:
+            correlation = 0.0
+        else:
+            numerator = np.sum((phi_q_vals - phi_q_mean) * (synergy_vals - synergy_mean))
+            denominator = (np.sqrt(np.sum((phi_q_vals - phi_q_mean) ** 2)) *
+                          np.sqrt(np.sum((synergy_vals - synergy_mean) ** 2)) + 1e-8)
+            correlation = float(numerator / denominator)
 
         return {
-            'correlation': float(numerator / denominator),
-            'phi_q_mean': float(phi_q_mean),
-            'synergy_mean': float(synergy_mean),
-            'num_samples': len(self.phi_q_vs_coordination),
+            'correlation': correlation,
+            'phi_q_mean': phi_q_mean,
+            'synergy_mean': synergy_mean,
+            'num_samples': num_samples,
         }
 
     def train(self):
