@@ -2,20 +2,25 @@
 Enhanced MERA Tensor Network for Reinforcement Learning
 ========================================================
 
-This module implements a GENUINE tensor network MERA with proper contractions,
-not an MLP approximation. The tensor network structure is what provides the
-unique inductive bias for hierarchical temporal reasoning.
+This module implements a tensor network MERA (Multi-scale Entanglement
+Renormalization Ansatz) encoder with proper tensor contractions.
 
-Key Research Contributions:
+The tensor network structure provides an inductive bias for hierarchical
+temporal reasoning through coarse-graining operations.
+
+Key Features:
 - True tensor network contractions (einsum operations)
 - Proper dimension handling across layers
 - Isometry constraint regularization (w†w = I)
-- Integrated information (Φ_Q) as intrinsic motivation
-- RG flow tracking for transfer learning
+- Layer scaling factor tracking for analysis
+- Hierarchical correlation metric as diagnostic probe
 
 Architecture:
 - Layer 0: physical_dim → bond_dim (dimension expansion)
 - Layer 1+: bond_dim → bond_dim (consistent dimensions)
+
+Note: The "hierarchical_entropy" metric is a correlation-based diagnostic,
+NOT a measure of quantum entanglement or integrated information (IIT).
 """
 
 import torch
@@ -43,15 +48,15 @@ class EnhancedMERAConfig:
     enforce_unitarity: bool = True
     unitarity_weight: float = 0.1  # Increased for better unitarity constraint
 
-    # RG flow regularization
-    enforce_rg_fixed_point: bool = True
-    rg_eigenvalue_weight: float = 0.01  # Reduced: too restrictive was hurting learning
-    rg_target_eigenvalue: float = 1.0   # Target RG eigenvalue (fixed point)
-    rg_loss_warmup_steps: int = 1000    # Warmup before applying full RG loss
+    # Layer scaling regularization (keeps scaling factors in reasonable range)
+    enforce_scaling_bounds: bool = True
+    scaling_weight: float = 0.01  # Reduced: too restrictive was hurting learning
+    scaling_target: float = 1.0   # Target scaling factor
+    scaling_loss_warmup_steps: int = 1000    # Warmup before applying full scaling loss
 
-    # Φ_Q computation (for analysis only - no gradients)
-    enable_phi_q: bool = True
-    phi_q_layers: List[int] = field(default_factory=lambda: [0, 1, 2])
+    # Hierarchical entropy computation (correlation-based diagnostic, NOT real IIT)
+    enable_hierarchical_entropy: bool = True
+    entropy_layers: List[int] = field(default_factory=lambda: [0, 1, 2])
 
     # Scale consistency (reduced - was too restrictive per experiment findings)
     scale_consistency_weight: float = 0.001  # Was 0.1, hurting performance by -6.3%
@@ -282,25 +287,29 @@ class TrueIsometry(nn.Module):
         return F.mse_loss(product, identity)
 
 
-class PhiQComputer(nn.Module):
+class HierarchicalEntropyComputer(nn.Module):
     """
-    Compute integrated information Φ_Q from tensor network states.
+    Compute a hierarchical correlation metric from tensor network states.
 
-    Φ_Q measures information integration - how much the whole system
-    knows that cannot be reduced to its parts. Uses entanglement entropy
-    as a quantum-inspired proxy.
+    NOTE: This is NOT integrated information (IIT) or quantum entanglement.
+    It computes SVD-based entropy of correlation matrices between layer sites,
+    which measures how correlated different parts of the representation are.
+
+    The metric is useful as a diagnostic to track representation structure
+    during training, but should not be interpreted as a consciousness measure.
     """
 
     def __init__(self, min_sites: int = 2):
         super().__init__()
         self.min_sites = min_sites
 
-    def compute_entanglement_entropy(self, sites: List[torch.Tensor],
-                                      partition_idx: int) -> torch.Tensor:
+    def compute_correlation_entropy(self, sites: List[torch.Tensor],
+                                     partition_idx: int) -> torch.Tensor:
         """
-        Compute entanglement entropy S_A for bipartition.
+        Compute entropy of correlation matrix singular values.
 
-        Uses SVD of the correlation matrix as proxy for Schmidt decomposition.
+        This measures how "spread out" the correlations are between
+        two partitions of sites - NOT quantum entanglement.
         """
         if partition_idx <= 0 or partition_idx >= len(sites):
             return torch.zeros(sites[0].shape[0], device=sites[0].device)
@@ -325,44 +334,43 @@ class PhiQComputer(nn.Module):
 
         return entropy
 
-    def compute_phi_for_partition(self, sites: List[torch.Tensor],
-                                    partition_idx: int) -> torch.Tensor:
-        """Compute Φ for a specific partition point."""
+    def compute_entropy_for_partition(self, sites: List[torch.Tensor],
+                                       partition_idx: int) -> torch.Tensor:
+        """Compute hierarchical entropy for a specific partition point."""
         if partition_idx <= 0 or partition_idx >= len(sites):
             return torch.zeros(sites[0].shape[0], device=sites[0].device)
 
         # Whole system entropy at this partition
-        S_whole = self.compute_entanglement_entropy(sites, partition_idx)
+        S_whole = self.compute_correlation_entropy(sites, partition_idx)
 
         # Parts entropy
         left_sites = sites[:partition_idx]
         right_sites = sites[partition_idx:]
 
-        S_left = self.compute_entanglement_entropy(left_sites, len(left_sites) // 2) \
+        S_left = self.compute_correlation_entropy(left_sites, len(left_sites) // 2) \
                  if len(left_sites) > 1 else torch.zeros_like(S_whole)
-        S_right = self.compute_entanglement_entropy(right_sites, len(right_sites) // 2) \
+        S_right = self.compute_correlation_entropy(right_sites, len(right_sites) // 2) \
                   if len(right_sites) > 1 else torch.zeros_like(S_whole)
 
-        # Φ at this partition
+        # Difference: whole minus sum of parts
         return S_whole - (S_left + S_right)
 
     def forward(self, sites: List[torch.Tensor]) -> torch.Tensor:
         """
-        Compute Φ_Q using Minimum Information Partition (MIP) approximation.
+        Compute hierarchical entropy metric across multiple partitions.
 
-        True IIT Φ requires finding the partition that minimizes integrated info.
-        We approximate by computing Φ over multiple partition points and taking
-        the minimum. This prevents artificially high Φ from arbitrary partitions.
+        This metric measures how much the correlation structure of the whole
+        differs from the sum of its parts. Higher values indicate more
+        "holistic" representations where correlations span partitions.
 
-        Positive Φ_Q indicates genuine information integration beyond parts.
+        NOTE: This is a heuristic diagnostic, not a rigorous information measure.
         """
         if len(sites) < self.min_sites:
             return torch.zeros(sites[0].shape[0], device=sites[0].device)
 
         n = len(sites)
 
-        # Compute Φ over multiple partition points (MIP approximation)
-        # Use partitions at 1/4, 1/3, 1/2, 2/3, 3/4 of sequence
+        # Compute metric over multiple partition points
         partition_points = []
         for frac in [0.25, 0.33, 0.5, 0.67, 0.75]:
             pt = int(n * frac)
@@ -372,109 +380,21 @@ class PhiQComputer(nn.Module):
         if not partition_points:
             partition_points = [n // 2]
 
-        # Compute Φ at each partition
-        phi_values = []
+        # Compute entropy at each partition
+        entropy_values = []
         for pt in partition_points:
-            phi = self.compute_phi_for_partition(sites, pt)
-            phi_values.append(phi)
+            ent = self.compute_entropy_for_partition(sites, pt)
+            entropy_values.append(ent)
 
-        # MIP: take minimum Φ across partitions
-        # This finds the "weakest link" - where integration is lowest
-        phi_stack = torch.stack(phi_values, dim=-1)  # (B, n_partitions)
-        phi_q = phi_stack.min(dim=-1)[0]  # (B,)
+        # Take minimum across partitions (most conservative estimate)
+        entropy_stack = torch.stack(entropy_values, dim=-1)
+        hierarchical_entropy = entropy_stack.min(dim=-1)[0]
 
-        return F.relu(phi_q)
+        return F.relu(hierarchical_entropy)
 
 
-class MERAIntrinsicMotivation(nn.Module):
-    """Intrinsic motivation from MERA structure"""
-
-    def __init__(self, config: EnhancedMERAConfig):
-        super().__init__()
-        self.config = config
-        self.phi_q_computer = PhiQComputer()
-
-        # Running statistics
-        self.register_buffer('phi_q_mean', torch.tensor(0.0))
-        self.register_buffer('phi_q_std', torch.tensor(1.0))
-        self.register_buffer('entanglement_mean', torch.tensor(0.0))
-        self.register_buffer('entanglement_std', torch.tensor(1.0))
-        self.register_buffer('update_count', torch.tensor(0))
-
-    def update_statistics(self, phi_q: torch.Tensor, entanglement: torch.Tensor):
-        momentum = 0.99
-        if self.update_count == 0:
-            self.phi_q_mean = phi_q.mean()
-            self.phi_q_std = phi_q.std() + 1e-8
-            self.entanglement_mean = entanglement.mean()
-            self.entanglement_std = entanglement.std() + 1e-8
-        else:
-            self.phi_q_mean = momentum * self.phi_q_mean + (1 - momentum) * phi_q.mean()
-            self.phi_q_std = momentum * self.phi_q_std + (1 - momentum) * (phi_q.std() + 1e-8)
-            self.entanglement_mean = momentum * self.entanglement_mean + (1 - momentum) * entanglement.mean()
-            self.entanglement_std = momentum * self.entanglement_std + (1 - momentum) * (entanglement.std() + 1e-8)
-        self.update_count += 1
-
-    def compute_intrinsic_reward(self, layer_states: List[List[torch.Tensor]],
-                                  rg_eigenvalues: List[float]) -> Dict[str, torch.Tensor]:
-        device = layer_states[0][0].device
-        batch_size = layer_states[0][0].shape[0]
-
-        # Φ_Q reward
-        phi_q_values = []
-        for layer_idx in self.config.phi_q_layers:
-            if layer_idx < len(layer_states) and len(layer_states[layer_idx]) >= 2:
-                phi_q = self.phi_q_computer(layer_states[layer_idx])
-                phi_q_values.append(phi_q)
-
-        phi_q_total = torch.stack(phi_q_values).mean(dim=0) if phi_q_values else torch.zeros(batch_size, device=device)
-
-        # Log-scale Φ_Q to make small values numerically significant
-        # Without this, Φ_Q ≈ 10^-5 is invisible to optimizer against reward ≈ 1.0
-        # log(10^-5) ≈ -11.5, log(10^-2) ≈ -4.6 → meaningful gradient signal
-        epsilon = 1e-8
-        phi_q_log = torch.log(phi_q_total + epsilon)
-
-        # Shift to positive range: add offset so typical values are > 0
-        # If phi_q ≈ 10^-5, log ≈ -11.5, shift by 15 → ~3.5
-        phi_q_scaled = phi_q_log + 15.0
-
-        # Entanglement reward
-        if len(layer_states[0]) > 1:
-            entanglement = self.phi_q_computer.compute_entanglement_entropy(
-                layer_states[0], len(layer_states[0]) // 2
-            )
-        else:
-            entanglement = torch.zeros(batch_size, device=device)
-
-        # RG novelty
-        if rg_eigenvalues:
-            rg_deviation = sum(abs(ev - 1.0) for ev in rg_eigenvalues) / len(rg_eigenvalues)
-            rg_novelty = torch.full((batch_size,), rg_deviation, device=device)
-        else:
-            rg_novelty = torch.zeros(batch_size, device=device)
-
-        if self.training:
-            self.update_statistics(phi_q_scaled.detach(), entanglement.detach())
-
-        # Normalize the log-scaled Φ_Q
-        phi_q_normalized = (phi_q_scaled - self.phi_q_mean) / (self.phi_q_std + 1e-8)
-        entanglement_normalized = (entanglement - self.entanglement_mean) / (self.entanglement_std + 1e-8)
-
-        total_intrinsic = (
-            self.config.phi_q_intrinsic_weight * phi_q_normalized +
-            self.config.entanglement_exploration_weight * entanglement_normalized
-        )
-
-        return {
-            'phi_q_reward': phi_q_normalized,
-            'entanglement_reward': entanglement_normalized,
-            'rg_novelty_reward': rg_novelty,
-            'total_intrinsic': total_intrinsic,
-            'phi_q_raw': phi_q_total,  # Original unscaled value
-            'phi_q_log_scaled': phi_q_scaled,  # Log-scaled value used for reward
-            'entanglement_raw': entanglement,
-        }
+# Backwards compatibility alias
+PhiQComputer = HierarchicalEntropyComputer
 
 
 # =============================================================================
@@ -533,14 +453,14 @@ class EnhancedTensorNetworkMERA(nn.Module):
         self.output_dim = config.bond_dim * 4
         self.output_projection = None
 
-        # Φ_Q computation (analysis probe only - no gradients)
-        self.phi_q_computer = PhiQComputer()
+        # Hierarchical entropy computation (diagnostic probe only - no gradients)
+        self.entropy_computer = HierarchicalEntropyComputer()
 
         # Scale consistency
         self.scale_projections = nn.ModuleDict()
 
-        # RG tracking
-        self.rg_eigenvalues_history = []
+        # Layer scaling factor tracking (NOT true RG eigenvalues - just norm ratios)
+        self.scaling_factors_history = []
 
     def set_step(self, step: int):
         """Update step counter for warmup scheduling"""
@@ -659,11 +579,15 @@ class EnhancedTensorNetworkMERA(nn.Module):
 
         return coarse
 
-    def compute_rg_eigenvalues(self, sites_before: List[torch.Tensor],
-                                sites_after: List[torch.Tensor],
-                                return_tensors: bool = False) -> List:
+    def compute_scaling_factors(self, sites_before: List[torch.Tensor],
+                                 sites_after: List[torch.Tensor],
+                                 return_tensors: bool = False) -> List:
         """
-        Compute RG flow eigenvalues.
+        Compute layer scaling factors (norm ratios before/after coarse-graining).
+
+        NOTE: These are NOT true RG eigenvalues from physics. They are simply
+        the ratio of output norm to input norm through isometry layers.
+        Values near 1.0 indicate signal preservation through layers.
 
         Args:
             sites_before: Sites before coarse-graining
@@ -671,9 +595,9 @@ class EnhancedTensorNetworkMERA(nn.Module):
             return_tensors: If True, return tensors for gradient computation
 
         Returns:
-            List of eigenvalues (floats or tensors)
+            List of scaling factors (floats or tensors)
         """
-        eigenvalues = []
+        scaling_factors = []
 
         for i, site_after in enumerate(sites_after):
             if 2*i + 1 < len(sites_before):
@@ -686,48 +610,43 @@ class EnhancedTensorNetworkMERA(nn.Module):
                 if valid_mask.any():
                     ratio = norm_after / (norm_before + 1e-6)
                     if return_tensors:
-                        eigenvalues.append(ratio.mean())
+                        scaling_factors.append(ratio.mean())
                     else:
-                        eigenvalues.append(ratio.mean().item())
+                        scaling_factors.append(ratio.mean().item())
 
-        return eigenvalues
+        return scaling_factors
 
-    def compute_rg_eigenvalue_loss(self, sites_before: List[torch.Tensor],
-                                    sites_after: List[torch.Tensor]) -> torch.Tensor:
+    def compute_scaling_loss(self, sites_before: List[torch.Tensor],
+                             sites_after: List[torch.Tensor]) -> torch.Tensor:
         """
-        Compute RG eigenvalue loss - penalize EXTREME values only.
+        Compute scaling factor regularization loss.
 
-        In physics MERA:
-        - λ > 1: relevant operators (important low-level features)
-        - λ = 1: marginal operators (scale-invariant)
-        - λ < 1: irrelevant operators (noise)
+        Penalizes extreme scaling factors to prevent signal explosion (>2.0)
+        or vanishing (<0.3) through layers. This is a practical regularizer,
+        not a physics constraint.
 
-        We allow eigenvalues to vary naturally, only penalizing extremes
-        (λ > 2.0 or λ < 0.3) to prevent instability.
-
-        Applies warmup: loss is scaled from 0 to full weight over rg_loss_warmup_steps.
+        Applies warmup: loss is scaled from 0 to full weight over warmup steps.
         """
-        if not self.config.enforce_rg_fixed_point:
+        if not self.config.enforce_scaling_bounds:
             return torch.tensor(0.0, device=next(self.parameters()).device)
 
-        eigenvalues = self.compute_rg_eigenvalues(sites_before, sites_after, return_tensors=True)
+        scaling_factors = self.compute_scaling_factors(sites_before, sites_after, return_tensors=True)
 
-        if not eigenvalues:
+        if not scaling_factors:
             return torch.tensor(0.0, device=next(self.parameters()).device)
 
-        # Stack eigenvalues for efficient computation (fixes gradient accumulation)
-        ev_tensor = torch.stack(eigenvalues)
+        # Stack for efficient computation
+        sf_tensor = torch.stack(scaling_factors)
 
-        # Penalize extremes only: λ > 2.0 or λ < 0.3
-        # This allows relevant (λ>1) and irrelevant (λ<1) operators to emerge naturally
-        upper_violation = F.relu(ev_tensor - 2.0)  # Penalize λ > 2.0
-        lower_violation = F.relu(0.3 - ev_tensor)  # Penalize λ < 0.3
+        # Penalize extremes only: >2.0 (explosion) or <0.3 (vanishing)
+        upper_violation = F.relu(sf_tensor - 2.0)
+        lower_violation = F.relu(0.3 - sf_tensor)
         loss = (upper_violation ** 2 + lower_violation ** 2).mean()
 
         # Apply warmup factor
-        warmup_factor = self.get_warmup_factor(self.config.rg_loss_warmup_steps)
+        warmup_factor = self.get_warmup_factor(self.config.scaling_loss_warmup_steps)
 
-        return loss * self.config.rg_eigenvalue_weight * warmup_factor
+        return loss * self.config.scaling_weight * warmup_factor
 
     def compute_constraint_loss(self) -> torch.Tensor:
         """Total constraint loss for unitarity and isometry.
@@ -787,23 +706,23 @@ class EnhancedTensorNetworkMERA(nn.Module):
         # Encode to physical_dim sites
         sites = self.encode_sequence(sequence)
         layer_states = [sites]
-        phi_q_values = []
-        all_rg_eigenvalues = []
-        rg_eigenvalue_loss = torch.tensor(0.0, device=sequence.device)
+        entropy_values = []
+        all_scaling_factors = []
+        scaling_loss = torch.tensor(0.0, device=sequence.device)
 
         # Layer 0: physical_dim → bond_dim
-        # Φ_Q computed without gradients - it's a probe/diagnostic only
-        if self.config.enable_phi_q and 0 in self.config.phi_q_layers and len(sites) >= 2:
+        # Hierarchical entropy computed without gradients - it's a probe/diagnostic only
+        if self.config.enable_hierarchical_entropy and 0 in self.config.entropy_layers and len(sites) >= 2:
             with torch.no_grad():
-                phi_q_values.append(self.phi_q_computer(sites))
+                entropy_values.append(self.entropy_computer(sites))
 
         sites_before = sites
         sites = self.apply_layer_0(sites)
-        rg_evs = self.compute_rg_eigenvalues(sites_before, sites)
-        if rg_evs:
-            all_rg_eigenvalues.extend(rg_evs)
-        # Compute RG loss for this layer
-        rg_eigenvalue_loss = rg_eigenvalue_loss + self.compute_rg_eigenvalue_loss(sites_before, sites)
+        sf = self.compute_scaling_factors(sites_before, sites)
+        if sf:
+            all_scaling_factors.extend(sf)
+        # Compute scaling loss for this layer
+        scaling_loss = scaling_loss + self.compute_scaling_loss(sites_before, sites)
         layer_states.append(sites)
 
         # Layers 1+: bond_dim → bond_dim
@@ -811,24 +730,22 @@ class EnhancedTensorNetworkMERA(nn.Module):
             if len(sites) <= 1:
                 break
 
-            if self.config.enable_phi_q and (layer_idx + 1) in self.config.phi_q_layers and len(sites) >= 2:
+            if self.config.enable_hierarchical_entropy and (layer_idx + 1) in self.config.entropy_layers and len(sites) >= 2:
                 with torch.no_grad():
-                    phi_q_values.append(self.phi_q_computer(sites))
+                    entropy_values.append(self.entropy_computer(sites))
 
             sites_before = sites
             sites = self.apply_layer_n(sites, layer_idx)
-            rg_evs = self.compute_rg_eigenvalues(sites_before, sites)
-            if rg_evs:
-                all_rg_eigenvalues.extend(rg_evs)
-            # Compute RG loss for this layer
-            rg_eigenvalue_loss = rg_eigenvalue_loss + self.compute_rg_eigenvalue_loss(sites_before, sites)
+            sf = self.compute_scaling_factors(sites_before, sites)
+            if sf:
+                all_scaling_factors.extend(sf)
+            # Compute scaling loss for this layer
+            scaling_loss = scaling_loss + self.compute_scaling_loss(sites_before, sites)
             layer_states.append(sites)
 
         # Final latent - use fixed-size pooling to handle variable number of sites
-        # This fixes the "dimension explosion" issue where concat creates variable-length vectors
         if len(sites) > 0:
             sites_stack = torch.stack(sites, dim=1)  # (B, n_sites, bond_dim)
-            # Use both max and mean pooling for richer representation
             max_pool = sites_stack.max(dim=1)[0]     # (B, bond_dim)
             mean_pool = sites_stack.mean(dim=1)      # (B, bond_dim)
             final_features = torch.cat([max_pool, mean_pool], dim=-1)  # (B, 2*bond_dim)
@@ -842,35 +759,36 @@ class EnhancedTensorNetworkMERA(nn.Module):
         self._ensure_output_projection(final_features.shape[-1], final_features.device)
         latent = self.output_projection(final_features)
 
-        # Aggregate Φ_Q
-        phi_q_total = torch.stack(phi_q_values).mean(dim=0) if phi_q_values else torch.zeros(
+        # Aggregate hierarchical entropy (for backwards compatibility, key is still 'phi_q')
+        entropy_total = torch.stack(entropy_values).mean(dim=0) if entropy_values else torch.zeros(
             sequence.shape[0], device=sequence.device
         )
 
-        # Track RG
-        if all_rg_eigenvalues:
-            self.rg_eigenvalues_history.append(all_rg_eigenvalues)
-            if len(self.rg_eigenvalues_history) > 100:
-                self.rg_eigenvalues_history.pop(0)
+        # Track scaling factors
+        if all_scaling_factors:
+            self.scaling_factors_history.append(all_scaling_factors)
+            if len(self.scaling_factors_history) > 100:
+                self.scaling_factors_history.pop(0)
 
         # Losses (regularization for encoder)
         constraint_loss = self.compute_constraint_loss()
-        scale_loss = self.compute_scale_consistency_loss(layer_states)
+        scale_consistency_loss = self.compute_scale_consistency_loss(layer_states)
 
         aux = {
-            'phi_q': phi_q_total.detach(),  # No gradients - probe only
+            'phi_q': entropy_total.detach(),  # Backwards compat key; no gradients - probe only
+            'hierarchical_entropy': entropy_total.detach(),  # New honest name
             'layer_states': layer_states,
-            'rg_eigenvalues': all_rg_eigenvalues,
+            'scaling_factors': all_scaling_factors,  # Renamed from rg_eigenvalues
             'constraint_loss': constraint_loss,
-            'scale_consistency_loss': scale_loss,
-            'rg_eigenvalue_loss': rg_eigenvalue_loss,
+            'scale_consistency_loss': scale_consistency_loss,
+            'scaling_loss': scaling_loss,  # Renamed from rg_eigenvalue_loss
             'num_sites_per_layer': [len(states) for states in layer_states],
         }
 
         return latent, aux
 
     def get_total_loss(self, aux: Dict) -> torch.Tensor:
-        return aux['constraint_loss'] + aux['scale_consistency_loss'] + aux['rg_eigenvalue_loss']
+        return aux['constraint_loss'] + aux['scale_consistency_loss'] + aux['scaling_loss']
 
 
 class MERAWorldModelEncoder(nn.Module):
@@ -905,14 +823,14 @@ UnitaryInitializer = None  # Removed - using inline initialization
 # =============================================================================
 
 if __name__ == "__main__":
-    print("Testing True Tensor Network MERA")
+    print("Testing MERA Tensor Network Encoder")
     print("=" * 70)
 
     config = EnhancedMERAConfig(
         num_layers=3,
         bond_dim=8,
         physical_dim=4,
-        enable_phi_q=True,
+        enable_hierarchical_entropy=True,
     )
 
     mera = EnhancedTensorNetworkMERA(config)
@@ -930,17 +848,19 @@ if __name__ == "__main__":
 
     print(f"   Input: {sequence.shape}")
     print(f"   Latent: {latent.shape}")
-    print(f"   Φ_Q: {aux['phi_q'].mean().item():.4f}")
+    print(f"   Hierarchical entropy: {aux['hierarchical_entropy'].mean().item():.4f}")
     print(f"   Sites per layer: {aux['num_sites_per_layer']}")
 
     print("\n2. Losses...")
     print(f"   Constraint: {aux['constraint_loss'].item():.6f}")
-    print(f"   Scale: {aux['scale_consistency_loss'].item():.6f}")
+    print(f"   Scale consistency: {aux['scale_consistency_loss'].item():.6f}")
+    print(f"   Scaling loss: {aux['scaling_loss'].item():.6f}")
 
-    print("\n3. Intrinsic rewards...")
-    intrinsic = aux['intrinsic_rewards']
-    print(f"   Φ_Q reward: {intrinsic['phi_q_reward'].mean().item():.4f}")
-    print(f"   Total: {intrinsic['total_intrinsic'].mean().item():.4f}")
+    print("\n3. Scaling factors...")
+    if aux['scaling_factors']:
+        print(f"   Layer scaling factors: {[f'{sf:.3f}' for sf in aux['scaling_factors']]}")
+    else:
+        print("   No scaling factors computed")
 
     print("\n4. Gradient test...")
     loss = latent.mean() + mera.get_total_loss(aux)
@@ -949,4 +869,4 @@ if __name__ == "__main__":
     print(f"   Gradient norm: {grad_norm:.4f}")
 
     print("\n" + "=" * 70)
-    print("All tests passed - True tensor network MERA working!")
+    print("All tests passed - MERA tensor network encoder working!")

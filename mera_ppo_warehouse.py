@@ -387,7 +387,7 @@ class PPOActorCritic(nn.Module):
             if mera_config is None:
                 mera_config = EnhancedMERAConfig(
                     num_layers=3, bond_dim=8, physical_dim=4,
-                    enable_phi_q=True, use_identity_init=True,
+                    enable_hierarchical_entropy=True, use_identity_init=True,
                     enforce_rg_fixed_point=True
                 )
             self.encoder = MERAEncoder(obs_dim, history_len, mera_config)
@@ -397,7 +397,7 @@ class PPOActorCritic(nn.Module):
             if mera_config is None:
                 mera_config = EnhancedMERAConfig(
                     num_layers=3, bond_dim=8, physical_dim=4,
-                    enable_phi_q=True, use_identity_init=True,
+                    enable_hierarchical_entropy=True, use_identity_init=True,
                     enforce_rg_fixed_point=True
                 )
             if config is None:
@@ -553,10 +553,10 @@ class MERAWarehousePPO:
             num_layers=3,
             bond_dim=self.config['agent']['world_model']['latent_dim'] // 32,
             physical_dim=4,
-            enable_phi_q=True,
+            enable_hierarchical_entropy=True,
             use_identity_init=True,
-            enforce_rg_fixed_point=True,
-            rg_eigenvalue_weight=0.01,  # Reduced per experiment findings
+            enforce_scaling_bounds=True,
+            scaling_weight=0.01,  # Reduced per experiment findings
         )
 
         # Create network (pass config for mera_uprt encoder)
