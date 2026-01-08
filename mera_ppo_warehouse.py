@@ -388,7 +388,7 @@ class PPOActorCritic(nn.Module):
                 mera_config = EnhancedMERAConfig(
                     num_layers=3, bond_dim=8, physical_dim=4,
                     enable_hierarchical_entropy=True, use_identity_init=True,
-                    enforce_rg_fixed_point=True
+                    enforce_scaling_bounds=True
                 )
             self.encoder = MERAEncoder(obs_dim, history_len, mera_config)
             encoder_dim = self.encoder.output_dim
@@ -398,7 +398,7 @@ class PPOActorCritic(nn.Module):
                 mera_config = EnhancedMERAConfig(
                     num_layers=3, bond_dim=8, physical_dim=4,
                     enable_hierarchical_entropy=True, use_identity_init=True,
-                    enforce_rg_fixed_point=True
+                    enforce_scaling_bounds=True
                 )
             if config is None:
                 raise ValueError("config required for mera_uprt encoder")
@@ -965,9 +965,23 @@ class MERAWarehousePPO:
         else:
             print("\n→ WEAK: Φ_Q doesn't strongly predict coordination.")
 
-        # Save
+        # Save analysis
         with open(self.output_dir / "analysis.json", 'w') as f:
             json.dump({'correlation': corr, 'encoder': self.encoder_type}, f, indent=2)
+
+        # Save results.json for run_experiments.py compatibility
+        results_data = {
+            'final_reward': self.episode_rewards[-1] if self.episode_rewards else 0,
+            'avg_reward': float(np.mean(self.episode_rewards[-10:])) if self.episode_rewards else 0,
+            'packages_delivered': sum(m.get('packages_delivered', 0) for m in self.coordination_history[-10:]) if self.coordination_history else 0,
+            'collisions': sum(m.get('total_collisions', 0) for m in self.coordination_history[-10:]) if self.coordination_history else 0,
+            'throughput': float(np.mean([m.get('throughput', 0) for m in self.coordination_history[-10:]])) if self.coordination_history else 0,
+            'phi_q': corr['phi_q_mean'],
+            'episode_steps': len(self.episode_rewards) * self.steps_per_epoch,
+        }
+        with open(self.output_dir / "results.json", 'w') as f:
+            json.dump(results_data, f, indent=2)
+        print(f"\nResults saved to {self.output_dir / 'results.json'}")
 
     def get_results(self) -> Dict:
         return {

@@ -452,7 +452,7 @@ class WarehouseEnv(gym.Env):
             # Determine spawn position
             if self.package_spawn_zones is not None:
                 # Clustered spawning: pick a random zone and spawn within it
-                zone = np.random.choice(self.package_spawn_zones)
+                zone = self.package_spawn_zones[np.random.randint(len(self.package_spawn_zones))]
                 center = np.array(zone['center'], dtype=np.float32)
                 radius = zone.get('radius', 5.0)
                 spawn_pos = center + np.random.randn(2) * radius * 0.3

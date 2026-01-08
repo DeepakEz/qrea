@@ -41,8 +41,7 @@ class EnhancedMERAConfig:
     physical_dim: int = 4            # d: physical dimension at input
     temporal_window: int = 50
 
-    # Physics-inspired constraints
-    causal_velocity: float = 1.0
+    # Tensor network constraints
     enforce_isometry: bool = True
     isometry_weight: float = 0.1  # Increased for better isometry constraint
     enforce_unitarity: bool = True
@@ -63,7 +62,6 @@ class EnhancedMERAConfig:
     scale_loss_warmup_steps: int = 1000  # Warmup before applying full scale loss
 
     # Training
-    use_gradient_checkpointing: bool = False
     dropout: float = 0.0
     use_identity_init: bool = True  # Initialize isometries near identity
 
