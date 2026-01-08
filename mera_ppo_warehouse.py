@@ -869,6 +869,9 @@ class MERAWarehousePPO:
                 'phi_q_mean': 0.0,
                 'synergy_mean': 0.0,
                 'num_samples': num_samples,
+                # Backward/forward compatible aliases
+                'phi_q': 0.0,
+                'synergy': 0.0,
             }
 
         phi_q_vals = np.array([x[0] for x in self.phi_q_vs_coordination])
@@ -891,6 +894,9 @@ class MERAWarehousePPO:
             'phi_q_mean': phi_q_mean,
             'synergy_mean': synergy_mean,
             'num_samples': num_samples,
+            # Backward/forward compatible aliases
+            'phi_q': phi_q_mean,
+            'synergy': synergy_mean,
         }
 
     def train(self):
@@ -986,14 +992,21 @@ class MERAWarehousePPO:
         print("=" * 70)
 
         corr = self.compute_phi_q_correlation()
-        print(f"\nSamples: {corr['num_samples']}")
-        print(f"Φ_Q mean: {corr['phi_q_mean']:.4f}")
-        print(f"Synergy mean: {corr['synergy_mean']:.3f}")
-        print(f"Pearson r: {corr['correlation']:.3f}")
 
-        if corr['correlation'] > 0.3:
+        # Safe extraction with fallbacks (bulletproof against schema changes)
+        phi_q_mean = float(corr.get('phi_q_mean', corr.get('phi_q', 0.0)))
+        synergy_mean = float(corr.get('synergy_mean', corr.get('synergy', 0.0)))
+        num_samples = int(corr.get('num_samples', 0))
+        r = float(corr.get('correlation', 0.0))
+
+        print(f"\nSamples: {num_samples}")
+        print(f"Φ_Q mean: {phi_q_mean:.4f}")
+        print(f"Synergy mean: {synergy_mean:.3f}")
+        print(f"Pearson r: {r:.3f}")
+
+        if r > 0.3:
             print("\n→ POSITIVE: Higher Φ_Q correlates with better coordination!")
-        elif corr['correlation'] < -0.3:
+        elif r < -0.3:
             print("\n→ NEGATIVE: Higher Φ_Q correlates with worse coordination.")
         else:
             print("\n→ WEAK: Φ_Q doesn't strongly predict coordination.")
@@ -1009,7 +1022,7 @@ class MERAWarehousePPO:
             'packages_delivered': sum(m.get('packages_delivered', 0) for m in self.coordination_history[-10:]) if self.coordination_history else 0,
             'collisions': sum(m.get('total_collisions', 0) for m in self.coordination_history[-10:]) if self.coordination_history else 0,
             'throughput': float(np.mean([m.get('throughput', 0) for m in self.coordination_history[-10:]])) if self.coordination_history else 0,
-            'phi_q': corr['phi_q_mean'],
+            'phi_q': phi_q_mean,  # Use safe extracted value
             'episode_steps': len(self.episode_rewards) * self.steps_per_epoch,
         }
         with open(self.output_dir / "results.json", 'w') as f:
