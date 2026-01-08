@@ -454,8 +454,19 @@ class EnhancedTensorNetworkMERA(nn.Module):
         # Hierarchical entropy computation (diagnostic probe only - no gradients)
         self.entropy_computer = HierarchicalEntropyComputer()
 
-        # Scale consistency
+        # Scale consistency projections - pre-created to ensure they're in optimizer
         self.scale_projections = nn.ModuleDict()
+        # Layer 0: odd site projection (physical_dim → bond_dim)
+        self.scale_projections['layer0_odd_proj'] = nn.Linear(config.physical_dim, config.bond_dim)
+        # Layer 0: scale consistency (2*physical_dim → bond_dim)
+        self.scale_projections[f'scale_0_{2*config.physical_dim}_{config.bond_dim}'] = nn.Linear(
+            2 * config.physical_dim, config.bond_dim
+        )
+        # Layers 1+: scale consistency (2*bond_dim → bond_dim)
+        for layer_idx in range(1, config.num_layers):
+            self.scale_projections[f'scale_{layer_idx}_{2*config.bond_dim}_{config.bond_dim}'] = nn.Linear(
+                2 * config.bond_dim, config.bond_dim
+            )
 
         # Layer scaling factor tracking (NOT true RG eigenvalues - just norm ratios)
         self.scaling_factors_history = []
@@ -517,13 +528,10 @@ class EnhancedTensorNetworkMERA(nn.Module):
             c = self.isometry_0(disentangled[i], disentangled[i + 1])
             coarse.append(c)
         if len(disentangled) % 2 == 1:
-            # Project last site to bond_dim
+            # Project last site to bond_dim (projection pre-created in __init__)
             last = disentangled[-1]
             if last.shape[-1] != self.bond_dim:
-                key = 'layer0_odd_proj'
-                if key not in self.scale_projections:
-                    self.scale_projections[key] = nn.Linear(last.shape[-1], self.bond_dim).to(last.device)
-                last = self.scale_projections[key](last)
+                last = self.scale_projections['layer0_odd_proj'](last)
             coarse.append(last)
 
         return coarse
@@ -687,12 +695,10 @@ class EnhancedTensorNetworkMERA(nn.Module):
                 if 2*i + 1 < len(sites_fine):
                     combined = torch.cat([sites_fine[2*i], sites_fine[2*i+1]], dim=-1)
                     key = f'scale_{layer_idx}_{combined.shape[-1]}_{site_coarse.shape[-1]}'
-                    if key not in self.scale_projections:
-                        self.scale_projections[key] = nn.Linear(
-                            combined.shape[-1], site_coarse.shape[-1]
-                        ).to(combined.device)
-                    projected = self.scale_projections[key](combined)
-                    total_loss = total_loss + F.mse_loss(projected, site_coarse.detach())
+                    # Use pre-created projection if available, otherwise skip (defensive)
+                    if key in self.scale_projections:
+                        projected = self.scale_projections[key](combined)
+                        total_loss = total_loss + F.mse_loss(projected, site_coarse.detach())
 
         # Apply warmup factor
         warmup_factor = self.get_warmup_factor(self.config.scale_loss_warmup_steps)

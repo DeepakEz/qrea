@@ -255,9 +255,11 @@ class WarehouseEnv(gym.Env):
     ]:
         """Execute one environment step"""
         self.current_step += 1
-        
-        # Apply actions to robots
-        for robot in self.robots:
+
+        # Apply actions to robots (randomize order to prevent robot 0 priority)
+        robot_order = np.random.permutation(len(self.robots))
+        for idx in robot_order:
+            robot = self.robots[idx]
             if robot.id in actions:
                 self._apply_action(robot, actions[robot.id])
         
@@ -380,7 +382,7 @@ class WarehouseEnv(gym.Env):
             
             # Check if at charging station
             for station in self.stations:
-                if station.type == "charging":
+                if station.type.startswith("charging"):
                     dist = np.linalg.norm(robot.position - station.position)
                     if dist < 2.0:  # Within charging range
                         robot.battery = min(
@@ -393,7 +395,10 @@ class WarehouseEnv(gym.Env):
         # Track just-delivered packages for reward calculation
         self._just_delivered = {}  # robot_id -> package_reward
 
-        for robot in self.robots:
+        # Randomize order to prevent robot 0 priority for deliveries
+        robot_order = np.random.permutation(len(self.robots))
+        for idx in robot_order:
+            robot = self.robots[idx]
             if robot.carrying_package is not None:
                 pkg = self._get_package(robot.carrying_package)
                 if pkg and not pkg.is_delivered:
@@ -458,7 +463,7 @@ class WarehouseEnv(gym.Env):
                 spawn_pos = center + np.random.randn(2) * radius * 0.3
             else:
                 # Default: spawn at pickup station
-                pickup_station = [s for s in self.stations if s.type == "pickup"][0]
+                pickup_station = [s for s in self.stations if s.type.startswith("pickup")][0]
                 spawn_pos = pickup_station.position + np.random.randn(2) * 0.5
 
             # Random delivery station
