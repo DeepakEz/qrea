@@ -1,6 +1,17 @@
 """
-UPRT (Unified Pattern Resonance Theory) Fields for Warehouse
-Implements consciousness, resonance, and genetic fields
+Spatial Activity Fields for Warehouse Environment
+=================================================
+
+Implements spatial grid-based activity tracking for multi-robot coordination.
+
+NOTE: The original names ("consciousness field", "resonance field", "genetic field")
+were misleading pseudoscience terminology. These are simply:
+- activity_field: Accumulates robot activity at spatial locations
+- interaction_field: Tracks pairwise robot proximity/similarity
+- memory_field: Long-term activity accumulation (slow decay)
+
+These fields provide spatial context to the RL agent but have no connection
+to actual consciousness, quantum resonance, or genetics.
 """
 
 import torch
@@ -24,8 +35,13 @@ class Symbol:
 
 class UPRTField(nn.Module):
     """
-    Unified Pattern Resonance Theory Field
-    Implements field dynamics for pattern emergence and resonance
+    Spatial Activity Field for multi-robot warehouse.
+
+    Maintains grid-based fields that track robot activity over space and time.
+    Fields are updated via diffusion and decay dynamics.
+
+    NOTE: Despite the class name, this is NOT based on any real physics theory.
+    The fields are simply spatial accumulators used as auxiliary observations.
     """
     
     def __init__(self, config: dict):
