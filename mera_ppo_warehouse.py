@@ -60,6 +60,7 @@ class Transition(NamedTuple):
     value: float
     log_prob: float
     phi_q: float
+    robot_position: Optional[np.ndarray] = None  # For mera_uprt encoder
 
 
 @dataclass
@@ -439,11 +440,15 @@ class PPOActorCritic(nn.Module):
         self.action_low = torch.tensor([-2.0, -1.57, 0.0])
         self.action_high = torch.tensor([2.0, 1.57, 1.0])
 
-    def forward(self, obs_history: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    def forward(self, obs_history: torch.Tensor,
+                robot_positions: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         if self.encoder_type == "mlp":
             batch_size = obs_history.shape[0]
             obs_flat = obs_history.reshape(batch_size, -1)
             latent, aux = self.encoder(obs_flat)
+        elif self.encoder_type == "mera_uprt":
+            # Pass robot_positions to SpatioTemporalEncoder for UPRT field sampling
+            latent, aux = self.encoder(obs_history, robot_positions)
         else:
             latent, aux = self.encoder(obs_history)
 
@@ -464,8 +469,9 @@ class PPOActorCritic(nn.Module):
         scaled = low + (torch.tanh(action) + 1.0) / 2.0 * (high - low)
         return scaled
 
-    def get_action(self, obs_history: torch.Tensor, deterministic: bool = False):
-        action_mean, value, aux = self(obs_history)
+    def get_action(self, obs_history: torch.Tensor, deterministic: bool = False,
+                   robot_positions: Optional[torch.Tensor] = None):
+        action_mean, value, aux = self(obs_history, robot_positions)
         action_std = self.actor_log_std.exp().expand_as(action_mean)
         dist = Normal(action_mean, action_std)
 
@@ -480,8 +486,9 @@ class PPOActorCritic(nn.Module):
         # Return both: scaled for env, raw for PPO updates
         return scaled_action, raw_action, value, log_prob, phi_q, aux
 
-    def evaluate_actions(self, obs_history: torch.Tensor, actions: torch.Tensor):
-        action_mean, value, aux = self(obs_history)
+    def evaluate_actions(self, obs_history: torch.Tensor, actions: torch.Tensor,
+                        robot_positions: Optional[torch.Tensor] = None):
+        action_mean, value, aux = self(obs_history, robot_positions)
         action_std = self.actor_log_std.exp().expand_as(action_mean)
         dist = Normal(action_mean, action_std)
         log_prob = dist.log_prob(actions).sum(-1)
@@ -607,6 +614,11 @@ class MERAWarehousePPO:
         tensors = [self._get_obs_tensor(i) for i in range(self.num_robots)]
         return torch.cat(tensors, dim=0)
 
+    def _get_robot_positions(self) -> torch.Tensor:
+        """Get current robot positions for UPRT field sampling"""
+        positions = np.array([robot.position for robot in self.env.robots])
+        return torch.from_numpy(positions).float().to(self.device)
+
     def collect_rollout(self) -> Tuple[Dict[int, List[Transition]], Dict]:
         """Collect experience from environment"""
         observations = self.env.reset()
@@ -626,9 +638,12 @@ class MERAWarehousePPO:
 
         for step in range(max_steps):
             obs_batch = self._get_all_obs_tensors()
+            robot_positions = self._get_robot_positions() if self.encoder_type == 'mera_uprt' else None
 
             with torch.no_grad():
-                scaled_actions, raw_actions, values, log_probs, phi_q, aux = self.network.get_action(obs_batch)
+                scaled_actions, raw_actions, values, log_probs, phi_q, aux = self.network.get_action(
+                    obs_batch, robot_positions=robot_positions
+                )
 
             scaled_actions_np = scaled_actions.cpu().numpy()  # For env
             raw_actions_np = raw_actions.cpu().numpy()  # For PPO updates
@@ -663,6 +678,8 @@ class MERAWarehousePPO:
             # =====================================================
 
             # Store transitions (use RAW actions for PPO updates)
+            # Get positions BEFORE step was taken (same as used for action selection)
+            positions_np = robot_positions.cpu().numpy() if robot_positions is not None else None
             for i in range(self.num_robots):
                 robot_transitions[i].append(Transition(
                     obs=np.stack(list(self.obs_history[i]), axis=0),
@@ -672,6 +689,7 @@ class MERAWarehousePPO:
                     value=values_np[i],
                     log_prob=log_probs_np[i],
                     phi_q=phi_q,
+                    robot_position=positions_np[i] if positions_np is not None else None,
                 ))
                 self.obs_history[i].append(next_obs[i])
                 episode_reward += rewards[i]
@@ -768,6 +786,15 @@ class MERAWarehousePPO:
         old_log_probs = torch.tensor([t.log_prob for t in all_transitions],
                                      dtype=torch.float32, device=self.device)
 
+        # Extract robot positions for mera_uprt encoder
+        if self.encoder_type == 'mera_uprt' and all_transitions[0].robot_position is not None:
+            robot_positions = torch.tensor(
+                np.stack([t.robot_position for t in all_transitions]),
+                dtype=torch.float32, device=self.device
+            )
+        else:
+            robot_positions = None
+
         all_returns, all_advantages = [], []
         for i in range(self.num_robots):
             if robot_transitions[i]:
@@ -781,23 +808,29 @@ class MERAWarehousePPO:
         returns = torch.cat(all_returns)
         advantages = torch.cat(all_advantages)
 
-        batch_size = len(all_transitions) // self.num_minibatches
+        # Fix: Ensure batch_size is at least 1 to prevent empty batches
+        batch_size = max(1, len(all_transitions) // self.num_minibatches)
 
         for _ in range(self.update_epochs):
             indices = np.random.permutation(len(all_transitions))
 
-            for start in range(0, len(all_transitions), max(batch_size, 1)):
+            for start in range(0, len(all_transitions), batch_size):
                 end = min(start + batch_size, len(all_transitions))
                 batch_idx = indices[start:end]
+
+                # Skip empty batches (shouldn't happen with batch_size >= 1, but be safe)
+                if len(batch_idx) == 0:
+                    continue
 
                 batch_obs = obs[batch_idx]
                 batch_actions = actions[batch_idx]
                 batch_old_log_probs = old_log_probs[batch_idx]
                 batch_returns = returns[batch_idx]
                 batch_advantages = advantages[batch_idx]
+                batch_positions = robot_positions[batch_idx] if robot_positions is not None else None
 
                 values, log_probs, entropy, aux = self.network.evaluate_actions(
-                    batch_obs, batch_actions
+                    batch_obs, batch_actions, batch_positions
                 )
 
                 ratio = torch.exp(log_probs - batch_old_log_probs)

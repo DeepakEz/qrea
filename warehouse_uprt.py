@@ -347,11 +347,21 @@ class UPRTField(nn.Module):
             return {
                 'num_symbols': 0,
                 'avg_usage': 0.0,
-                'diversity': 0.0
+                'diversity': 0.0,
+                'active_symbols': 0
             }
-        
+
+        # With only 1 symbol, diversity is undefined (no pairs to compare)
+        if len(self.symbols) == 1:
+            return {
+                'num_symbols': 1,
+                'avg_usage': float(self.symbols[0].usage_count),
+                'diversity': 0.0,  # No diversity with single symbol
+                'active_symbols': 1 if self.symbols[0].activation > 0.1 else 0
+            }
+
         usages = [s.usage_count for s in self.symbols]
-        
+
         # Diversity: how different are the symbols
         embeddings = torch.stack([s.embedding for s in self.symbols])
         similarities = torch.matmul(
