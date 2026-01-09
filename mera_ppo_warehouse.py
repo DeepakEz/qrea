@@ -276,6 +276,11 @@ class SpatioTemporalEncoder(nn.Module):
         self.history_len = history_len
         self.device = device
 
+        # Store world grid size from config (for position normalization)
+        self.world_grid_size = torch.tensor(
+            config['environment']['grid_size'], dtype=torch.float32
+        )
+
         # Temporal encoder (MERA)
         self.mera_encoder = MERAEncoder(obs_dim, history_len, mera_config)
         mera_dim = self.mera_encoder.output_dim
@@ -313,9 +318,10 @@ class SpatioTemporalEncoder(nn.Module):
         """
         batch_size = position.shape[0]
 
-        # Normalize position to field grid coordinates
+        # Normalize position to field grid coordinates using actual world grid size
         grid_size = self.uprt_field.grid_resolution
-        normalized = position / 50.0  # Assuming 50x50 grid
+        world_size = self.world_grid_size.to(position.device)
+        normalized = position / world_size  # Use config grid_size, not hardcoded 50.0
         grid_x = (normalized[:, 0] * (grid_size[0] - 1)).long().clamp(0, grid_size[0] - 1)
         grid_y = (normalized[:, 1] * (grid_size[1] - 1)).long().clamp(0, grid_size[1] - 1)
 
@@ -528,8 +534,9 @@ class MERAWarehousePPO:
         self.encoder_type = encoder_type
         self.num_epochs = num_epochs
 
-        # Override max_steps for faster training (original is 5000, too long)
-        self.config['environment']['max_episode_steps'] = 500
+        # Override max_steps for training (original is 5000)
+        # Increased from 500 to 1000 to give agents more time to complete pickup-delivery
+        self.config['environment']['max_episode_steps'] = 1000
 
         # Create environment
         self.env = WarehouseEnv(self.config)
@@ -722,6 +729,13 @@ class MERAWarehousePPO:
                 )
 
                 self.coordination_history.append(asdict(metrics))
+
+                # Verbose episode logging for diagnostics
+                print(f"  [Episode {self.episode_count}] "
+                      f"Pickups: {env_stats.get('packages_picked_up', 0)}, "
+                      f"Delivered: {env_stats['packages_delivered']}, "
+                      f"Collisions: {env_stats['collisions']}, "
+                      f"Steps: {episode_steps}")
 
                 if episode_phi_q:
                     avg_phi_q = np.mean(episode_phi_q)
