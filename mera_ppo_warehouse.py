@@ -554,9 +554,11 @@ class MERAWarehousePPO:
         self.lr = learning_config['learning_rate']
         self.grad_clip = learning_config['grad_clip']
 
-        # Training params - increased for longer episodes
+        # Training params
         self.history_len = 16
-        self.steps_per_epoch = 4096  # Increased to ensure episodes complete
+        # steps_per_epoch must be > max_steps * num_robots to complete at least 1 episode
+        # With max_steps=1000 and 8 robots: need > 8000 steps
+        self.steps_per_epoch = max(8192, self.env.max_steps * self.num_robots * 2)
         self.num_minibatches = 8
         self.update_epochs = 4
         self.clip_epsilon = 0.2
@@ -605,7 +607,7 @@ class MERAWarehousePPO:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"  Environment: max_steps={self.env.max_steps}, robots={self.num_robots}")
-        print(f"  Steps per epoch: {self.steps_per_epoch}")
+        print(f"  Steps per epoch: {self.steps_per_epoch} (~{self.steps_per_epoch // (self.env.max_steps * self.num_robots)} episodes/epoch)")
 
     def _reset_obs_history(self, observations: Dict[int, np.ndarray]):
         for robot_id, obs in observations.items():
