@@ -163,6 +163,7 @@ class WarehouseEnv(gym.Env):
         # Statistics
         self.stats = {
             'packages_delivered': 0,
+            'packages_picked_up': 0,  # Track pickups to show learning progress
             'total_waiting_time': 0.0,
             'total_distance': 0.0,
             'total_energy': 0.0,
@@ -438,6 +439,7 @@ class WarehouseEnv(gym.Env):
             robot.carrying_package = nearest_pkg.id
             nearest_pkg.assigned_robot = robot.id
             nearest_pkg.pickup_time = self.current_step * self.dt
+            self.stats['packages_picked_up'] += 1
             self.stats['total_distance'] += min_dist
     
     def _spawn_packages(self, initial: bool = False):
