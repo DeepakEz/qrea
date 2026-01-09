@@ -51,7 +51,6 @@ class EnhancedMERAConfig:
     enforce_scaling_bounds: bool = True
     scaling_weight: float = 0.01  # Reduced: too restrictive was hurting learning
     scaling_target: float = 1.0   # Target scaling factor
-    scaling_loss_warmup_steps: int = 1000    # Warmup before applying full scaling loss
 
     # Hierarchical entropy computation (correlation-based diagnostic, NOT real IIT)
     enable_hierarchical_entropy: bool = True
@@ -59,7 +58,7 @@ class EnhancedMERAConfig:
 
     # Scale consistency (reduced - was too restrictive per experiment findings)
     scale_consistency_weight: float = 0.001  # Was 0.1, hurting performance by -6.3%
-    scale_loss_warmup_steps: int = 1000  # Warmup before applying full scale loss
+    warmup_steps: int = 1000  # Warmup before applying full scale/scaling loss
 
     # Training
     dropout: float = 0.0
@@ -650,7 +649,7 @@ class EnhancedTensorNetworkMERA(nn.Module):
         loss = (upper_violation ** 2 + lower_violation ** 2).mean()
 
         # Apply warmup factor
-        warmup_factor = self.get_warmup_factor(self.config.scaling_loss_warmup_steps)
+        warmup_factor = self.get_warmup_factor(self.config.warmup_steps)
 
         return loss * self.config.scaling_weight * warmup_factor
 
@@ -680,7 +679,7 @@ class EnhancedTensorNetworkMERA(nn.Module):
     def compute_scale_consistency_loss(self, layer_states: List[List[torch.Tensor]]) -> torch.Tensor:
         """Scale consistency across layers.
 
-        Applies warmup: loss is scaled from 0 to full weight over scale_loss_warmup_steps.
+        Applies warmup: loss is scaled from 0 to full weight over warmup_steps.
         """
         if len(layer_states) < 2:
             return torch.tensor(0.0, device=layer_states[0][0].device)
@@ -701,7 +700,7 @@ class EnhancedTensorNetworkMERA(nn.Module):
                         total_loss = total_loss + F.mse_loss(projected, site_coarse.detach())
 
         # Apply warmup factor
-        warmup_factor = self.get_warmup_factor(self.config.scale_loss_warmup_steps)
+        warmup_factor = self.get_warmup_factor(self.config.warmup_steps)
 
         return total_loss * self.config.scale_consistency_weight * warmup_factor
 
