@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -96,12 +97,11 @@ def run_single_experiment(
     # Use unique output dir for this run
     output_dir = f"./results_{encoder}_robots{num_robots}_seed{seed}"
 
-    # Write temporary config
-    temp_config = f"temp_config_seed{seed}.yaml"
-    with open(temp_config, 'w') as f:
-        yaml.dump(config, f)
-
+    # Write temporary config using tempfile to avoid collisions when running in parallel
+    temp_fd, temp_config = tempfile.mkstemp(suffix='.yaml', prefix=f'config_{encoder}_seed{seed}_')
     try:
+        with os.fdopen(temp_fd, 'w') as f:
+            yaml.dump(config, f)
         # Set seed via environment variable
         env = os.environ.copy()
         env['PYTHONHASHSEED'] = str(seed)

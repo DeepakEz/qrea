@@ -74,7 +74,8 @@ class EpisodicMemory:
     def __init__(self, capacity: int = 10000, embedding_dim: int = 128):
         self.capacity = capacity
         self.embedding_dim = embedding_dim
-        self.episodes: List[Episode] = []
+        # Use deque with maxlen for O(1) removal instead of list.pop(0) which is O(n)
+        self.episodes: deque = deque(maxlen=capacity)
 
         # Simple embedding: random projection (could use learned embeddings)
         self.projection = np.random.randn(512, embedding_dim) / np.sqrt(512)
@@ -108,11 +109,8 @@ class EpisodicMemory:
             embedding=embedding
         )
 
+        # deque with maxlen automatically handles capacity - O(1) vs O(n) for list.pop(0)
         self.episodes.append(episode)
-
-        # Forget oldest if over capacity
-        if len(self.episodes) > self.capacity:
-            self.episodes.pop(0)
 
     def retrieve_similar(self, obs: np.ndarray, action: np.ndarray,
                          k: int = 5) -> List[Episode]:

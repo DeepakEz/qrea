@@ -194,8 +194,9 @@ class WarehouseEnv(gym.Env):
     
     def _create_observation_space(self):
         """Create observation space"""
-        # Robot state (10) + LIDAR (32) + Package info (100*4) + Station info (4*3) + Others (7*8)
-        obs_dim = 10 + self.lidar_rays + 400 + 12 + 56
+        # Robot state (10) + LIDAR (lidar_rays) + Package info (100*4) + Station info (4*3) + Others ((num_robots-1)*8)
+        others_dim = (self.num_robots - 1) * 8  # Adapts to actual number of robots
+        obs_dim = 10 + self.lidar_rays + 400 + 12 + others_dim
         return spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -724,11 +725,12 @@ class WarehouseEnv(gym.Env):
 
                         # PRE-PICKUP REWARD: Being close AND slow (teaches pickup behavior)
                         # This is critical - without this, agent never learns to slow down
+                        # Increased from 3.0 to 8.0 to overcome progress reward bias
                         if nearest_pkg_dist < 3.0:  # Very close to package
                             # Reward for slowing down (speed < 1.0 required for pickup)
                             speed_factor = max(0, 1.0 - robot.speed)  # Higher when slower
                             close_factor = 1.0 - nearest_pkg_dist / 3.0  # Higher when closer
-                            pre_pickup_reward = 3.0 * speed_factor * close_factor
+                            pre_pickup_reward = 8.0 * speed_factor * close_factor
                             reward += pre_pickup_reward
 
                 # Low battery penalty (only in dense mode)
