@@ -46,15 +46,20 @@ class UPRTField(nn.Module):
     
     def __init__(self, config: dict):
         super().__init__()
-        
+
         self.config = config
         uprt_cfg = config['uprt']
-        
+
         # Field parameters
         self.grid_resolution = uprt_cfg['field']['grid_resolution']
         self.diffusion_coeff = uprt_cfg['field']['diffusion_coeff']
         self.decay_rate = uprt_cfg['field']['decay_rate']
         self.update_rate = uprt_cfg['field']['update_rate']
+
+        # World grid size from config (NOT hardcoded 50.0)
+        self.world_size = torch.tensor(
+            config['environment']['grid_size'], dtype=torch.float32
+        )
         
         # Field grids [H, W, channels] - registered as buffers for proper device handling
         self.register_buffer('consciousness_field', torch.zeros(
@@ -117,9 +122,10 @@ class UPRTField(nn.Module):
             robot_positions: [N, 2] positions in world coords
             robot_activities: [N, D] activity vectors
         """
-        # Convert world coords to grid coords
-        grid_x = (robot_positions[:, 0] / 50.0 * self.grid_resolution[0]).long()
-        grid_y = (robot_positions[:, 1] / 50.0 * self.grid_resolution[1]).long()
+        # Convert world coords to grid coords using config world_size
+        world_size = self.world_size.to(robot_positions.device)
+        grid_x = (robot_positions[:, 0] / world_size[0] * self.grid_resolution[0]).long()
+        grid_y = (robot_positions[:, 1] / world_size[1] * self.grid_resolution[1]).long()
         
         grid_x = torch.clamp(grid_x, 0, self.grid_resolution[0] - 1)
         grid_y = torch.clamp(grid_y, 0, self.grid_resolution[1] - 1)
@@ -167,32 +173,58 @@ class UPRTField(nn.Module):
         
         return diffused.permute(1, 2, 0)
     
-    def _update_resonance_field(self, positions: torch.Tensor, 
+    def _update_resonance_field(self, positions: torch.Tensor,
                                activities: torch.Tensor, dt: float):
-        """Update resonance field based on agent interactions"""
-        # Compute pairwise resonances
+        """Update resonance field based on agent interactions (vectorized)"""
         N = positions.shape[0]
-        
-        for i in range(N):
-            for j in range(i + 1, N):
-                # Distance-based coupling
-                dist = torch.norm(positions[i] - positions[j])
-                if dist < 10.0:  # Within resonance range
-                    # Compute resonance strength
-                    resonance = self._compute_resonance(
-                        activities[i], activities[j]
-                    )
-                    
-                    # Update field at midpoint
-                    mid_pos = (positions[i] + positions[j]) / 2
-                    gx = int(mid_pos[0] / 50.0 * self.grid_resolution[0])
-                    gy = int(mid_pos[1] / 50.0 * self.grid_resolution[1])
-                    
-                    gx = np.clip(gx, 0, self.grid_resolution[0] - 1)
-                    gy = np.clip(gy, 0, self.grid_resolution[1] - 1)
-                    
-                    self.resonance_field[gx, gy] += resonance * dt
-        
+        if N < 2:
+            # No pairs to process
+            self.resonance_field = self._apply_diffusion(
+                self.resonance_field, self.diffusion_coeff * 2, dt
+            )
+            self.resonance_field *= (1 - self.decay_rate * 0.5 * dt)
+            return
+
+        # Vectorized pairwise distance computation - O(N²) but in parallel
+        dists = torch.cdist(positions, positions)  # (N, N)
+
+        # Get upper triangle indices (pairs i < j)
+        i_idx, j_idx = torch.triu_indices(N, N, offset=1)
+
+        # Filter pairs within resonance range
+        pair_dists = dists[i_idx, j_idx]
+        mask = pair_dists < 10.0
+
+        if mask.sum() > 0:
+            # Get valid pair indices
+            valid_i = i_idx[mask]
+            valid_j = j_idx[mask]
+
+            # Vectorized resonance computation
+            act_i = activities[valid_i]  # (num_pairs, D)
+            act_j = activities[valid_j]  # (num_pairs, D)
+
+            # Normalize activities
+            act_i_norm = act_i / (torch.norm(act_i, dim=1, keepdim=True) + 1e-8)
+            act_j_norm = act_j / (torch.norm(act_j, dim=1, keepdim=True) + 1e-8)
+
+            # Cosine similarity on first 16 dims
+            similarity = (act_i_norm[:, :16] * act_j_norm[:, :16]).sum(dim=1)
+            resonances = torch.sigmoid(similarity * 5.0)  # (num_pairs,)
+
+            # Compute midpoints and grid coords
+            mid_pos = (positions[valid_i] + positions[valid_j]) / 2  # (num_pairs, 2)
+            world_size = self.world_size.to(positions.device)
+            gx = (mid_pos[:, 0] / world_size[0] * self.grid_resolution[0]).long()
+            gy = (mid_pos[:, 1] / world_size[1] * self.grid_resolution[1]).long()
+            gx = torch.clamp(gx, 0, self.grid_resolution[0] - 1)
+            gy = torch.clamp(gy, 0, self.grid_resolution[1] - 1)
+
+            # Scatter add resonances to field (vectorized)
+            # Use index_add_ for accumulation at grid positions
+            for idx in range(len(gx)):
+                self.resonance_field[gx[idx], gy[idx]] += resonances[idx] * dt
+
         # Diffuse and decay
         self.resonance_field = self._apply_diffusion(
             self.resonance_field, self.diffusion_coeff * 2, dt
@@ -203,10 +235,11 @@ class UPRTField(nn.Module):
                              activities: torch.Tensor, dt: float):
         """Update genetic field (inherited behavioral patterns)"""
         # Genetic field accumulates successful patterns
+        world_size = self.world_size.to(positions.device)
         for i in range(positions.shape[0]):
-            gx = int(positions[i, 0] / 50.0 * self.grid_resolution[0])
-            gy = int(positions[i, 1] / 50.0 * self.grid_resolution[1])
-            
+            gx = int(positions[i, 0] / world_size[0].item() * self.grid_resolution[0])
+            gy = int(positions[i, 1] / world_size[1].item() * self.grid_resolution[1])
+
             gx = np.clip(gx, 0, self.grid_resolution[0] - 1)
             gy = np.clip(gy, 0, self.grid_resolution[1] - 1)
             
@@ -321,9 +354,10 @@ class UPRTField(nn.Module):
     
     def get_field_at_position(self, position: np.ndarray) -> Dict[str, torch.Tensor]:
         """Get field values at world position"""
-        gx = int(position[0] / 50.0 * self.grid_resolution[0])
-        gy = int(position[1] / 50.0 * self.grid_resolution[1])
-        
+        world_size = self.world_size.cpu().numpy()
+        gx = int(position[0] / world_size[0] * self.grid_resolution[0])
+        gy = int(position[1] / world_size[1] * self.grid_resolution[1])
+
         gx = np.clip(gx, 0, self.grid_resolution[0] - 1)
         gy = np.clip(gy, 0, self.grid_resolution[1] - 1)
         
