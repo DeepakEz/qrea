@@ -555,7 +555,8 @@ class MERAWarehousePPO:
         self.grad_clip = learning_config['grad_clip']
 
         # Training params
-        self.history_len = 16
+        # Increased history_len from 16 to 32 for better temporal context (helps Φ_Q)
+        self.history_len = 32
         # steps_per_epoch must be > max_steps * num_robots to complete at least 1 episode
         # With max_steps=1000 and 8 robots: need > 8000 steps
         self.steps_per_epoch = max(8192, self.env.max_steps * self.num_robots * 2)

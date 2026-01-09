@@ -213,7 +213,8 @@ class TrueIsometry(nn.Module):
 
         # Add noise to break symmetry and enable entanglement/Φ_Q
         # Without this, pure identity init means zero entanglement
-        noise = torch.randn(d_out, d_in * d_in) * 0.3
+        # Increased from 0.3 to 0.5 for stronger initial structure and faster Φ_Q emergence
+        noise = torch.randn(d_out, d_in * d_in) * 0.5
         flat = flat + noise
 
         # Reshape back to tensor form
@@ -446,8 +447,8 @@ class EnhancedTensorNetworkMERA(nn.Module):
         # Input embedding: input_dim → physical_dim
         self.input_embedding = None
 
-        # Output projection
-        self.output_dim = config.bond_dim * 4
+        # Output projection (bond_dim * 2 matches typical final layer output of 2 sites)
+        self.output_dim = config.bond_dim * 2
         self.output_projection = None
 
         # Hierarchical entropy computation (diagnostic probe only - no gradients)
