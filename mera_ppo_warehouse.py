@@ -68,6 +68,7 @@ class CoordinationMetrics:
     """Metrics for multi-agent coordination quality"""
     total_collisions: int = 0
     packages_delivered: int = 0
+    packages_picked_up: int = 0
     total_distance: float = 0.0
     total_energy: float = 0.0
     episode_length: int = 0
@@ -712,6 +713,7 @@ class MERAWarehousePPO:
                 metrics = CoordinationMetrics(
                     total_collisions=env_stats['collisions'],
                     packages_delivered=env_stats['packages_delivered'],
+                    packages_picked_up=env_stats.get('packages_picked_up', 0),
                     total_distance=env_stats.get('total_distance', 0),
                     total_energy=env_stats.get('total_energy', 0.001),
                     episode_length=episode_steps,
@@ -941,14 +943,16 @@ class MERAWarehousePPO:
                 if env_stats:
                     avg_collisions = env_stats.get('collisions', 0)
                     avg_delivered = env_stats.get('packages_delivered', 0)
+                    avg_pickups = env_stats.get('packages_picked_up', 0)
                     avg_throughput = env_stats.get('throughput', 0)
                 elif self.coordination_history:
                     recent = self.coordination_history[-10:]
                     avg_collisions = np.mean([m['total_collisions'] for m in recent])
                     avg_delivered = np.mean([m['packages_delivered'] for m in recent])
+                    avg_pickups = np.mean([m.get('packages_picked_up', 0) for m in recent])
                     avg_throughput = np.mean([m['throughput'] for m in recent])
                 else:
-                    avg_collisions = avg_delivered = avg_throughput = 0
+                    avg_collisions = avg_delivered = avg_pickups = avg_throughput = 0
 
                 correlation = self.compute_phi_q_correlation()
 
@@ -956,6 +960,7 @@ class MERAWarehousePPO:
                 print(f"  Reward:      {avg_reward:.2f}")
                 print(f"  Φ_Q:         {avg_phi_q:.4f}")
                 print(f"  Collisions:  {avg_collisions:.1f}")
+                print(f"  Pickups:     {avg_pickups:.0f}")
                 print(f"  Delivered:   {avg_delivered:.1f}")
                 print(f"  Throughput:  {avg_throughput:.1f}/hr")
                 print(f"  Φ_Q↔Synergy: r={correlation['correlation']:.3f}")
