@@ -327,19 +327,9 @@ class WarehouseEnv(gym.Env):
         # Update angular velocity
         robot.angular_velocity = angular_vel
         
-        # Handle gripper - also auto-trigger when very close and slow
-        # This helps agents learn that stopping near packages is good
+        # Handle gripper - agent must LEARN to use gripper action
+        # No auto-pickup: research validity requires natural learning
         should_try_pickup = gripper > 0.5
-
-        # Auto-pickup: if close to package, try pickup automatically
-        # RELAXED: speed < 2.0 (was 1.0), dist < 3.0 (was 2.0) - 20× more likely to trigger
-        if robot.speed < 2.0 and robot.carrying_package is None:
-            for pkg in self.packages:
-                if not pkg.is_delivered and pkg.assigned_robot is None:
-                    dist = np.linalg.norm(robot.position - pkg.position)
-                    if dist < 3.0:  # Expanded from 2.0
-                        should_try_pickup = True
-                        break
 
         if should_try_pickup:
             self._try_pickup_or_deliver(robot)
@@ -419,12 +409,11 @@ class WarehouseEnv(gym.Env):
         if robot.carrying_package is not None:
             return  # Already carrying
 
-        # Robot must slow down to pickup
-        # RELAXED: speed < 2.0 (was 1.0) - allows pickup at moderate speeds
-        if robot.speed > 2.0:
+        # Robot must slow down to pickup - ORIGINAL threshold for research validity
+        if robot.speed > 1.0:
             return
 
-        # Find nearest unassigned package
+        # Find nearest unassigned package - ORIGINAL radius for research validity
         min_dist = float('inf')
         nearest_pkg = None
 
@@ -433,7 +422,7 @@ class WarehouseEnv(gym.Env):
                 continue
 
             dist = np.linalg.norm(robot.position - pkg.position)
-            if dist < 2.0 and dist < min_dist:  # EXPANDED pickup radius (was 1.5)
+            if dist < 1.5 and dist < min_dist:  # Original pickup radius
                 min_dist = dist
                 nearest_pkg = pkg
         
@@ -732,13 +721,14 @@ class WarehouseEnv(gym.Env):
                         progress_reward = 0.3 * (1.0 - min(nearest_pkg_dist, max_dist) / max_dist)
                         reward += progress_reward
 
-                        # PRE-PICKUP REWARD: EXPANDED range (8.0) and reward (50.0)
-                        # Teaches agent that approaching + slowing near packages is valuable
-                        if nearest_pkg_dist < 8.0:  # Expanded from 5.0
-                            # Speed factor works with relaxed threshold (speed < 2.0 for pickup)
-                            speed_factor = max(0, 1.0 - robot.speed / 2.0)  # Normalized to new threshold
-                            close_factor = 1.0 - nearest_pkg_dist / 8.0
-                            pre_pickup_reward = 50.0 * speed_factor * close_factor  # Increased from 30.0
+                        # PRE-PICKUP REWARD: Teaches agent to slow down near packages
+                        # Zone: 5m radius, reward scales with closeness and slowness
+                        # Agent must learn: speed < 1.0 AND dist < 1.5 for actual pickup
+                        if nearest_pkg_dist < 5.0:
+                            # Speed factor: rewards slowing down (pickup requires speed < 1.0)
+                            speed_factor = max(0, 1.0 - robot.speed)  # Full reward at speed=0
+                            close_factor = 1.0 - nearest_pkg_dist / 5.0
+                            pre_pickup_reward = 20.0 * speed_factor * close_factor
                             reward += pre_pickup_reward
 
                 # Low battery penalty
