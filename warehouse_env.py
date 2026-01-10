@@ -690,7 +690,7 @@ class WarehouseEnv(gym.Env):
                 if pkg and pkg.pickup_time is not None:
                     time_since_pickup = self.current_step * self.dt - pkg.pickup_time
                     if time_since_pickup < 0.2:  # just picked up
-                        reward += 10.0 if not self.sparse_rewards else 20.0
+                        reward += 25.0  # INCREASED from 10.0 to 25.0
 
             # === COLLISION PENALTY - always applied ===
             if robot.collision_count > 0:
@@ -706,7 +706,8 @@ class WarehouseEnv(gym.Env):
                     pkg = self._get_package(robot.carrying_package)
                     if pkg and not pkg.is_delivered:
                         dist_to_dest = np.linalg.norm(robot.position - pkg.destination)
-                        progress_reward = 2.0 * (1.0 - dist_to_dest / 70.0)
+                        # FIXED: Reduced from 2.0 to 0.1 (20× reduction)
+                        progress_reward = 0.1 * (1.0 - dist_to_dest / 70.0)
                         reward += max(0, progress_reward)
                 else:
                     # Not carrying: reward for approaching packages
@@ -718,22 +719,20 @@ class WarehouseEnv(gym.Env):
                                 nearest_pkg_dist = dist
 
                     if nearest_pkg_dist < float('inf'):
-                        # Use grid diagonal (~70m) as max distance for proper gradient
-                        max_dist = np.linalg.norm(self.grid_size)  # ~70m for 50x50 grid
-                        progress_reward = 1.0 * (1.0 - min(nearest_pkg_dist, max_dist) / max_dist)
+                        max_dist = np.linalg.norm(self.grid_size)
+                        # CRITICAL FIX: Reduced from 1.0 to 0.05 (20× reduction)
+                        # Now hovering = 50 total, pickup+delivery = 125 total
+                        progress_reward = 0.05 * (1.0 - min(nearest_pkg_dist, max_dist) / max_dist)
                         reward += progress_reward
 
-                        # PRE-PICKUP REWARD: Being close AND slow (teaches pickup behavior)
-                        # This is critical - without this, agent never learns to slow down
-                        # Increased from 3.0 to 8.0 to overcome progress reward bias
-                        if nearest_pkg_dist < 3.0:  # Very close to package
-                            # Reward for slowing down (speed < 1.0 required for pickup)
-                            speed_factor = max(0, 1.0 - robot.speed)  # Higher when slower
-                            close_factor = 1.0 - nearest_pkg_dist / 3.0  # Higher when closer
-                            pre_pickup_reward = 8.0 * speed_factor * close_factor
+                        # PRE-PICKUP REWARD: Increased from 8.0 to 15.0
+                        if nearest_pkg_dist < 3.0:
+                            speed_factor = max(0, 1.0 - robot.speed)
+                            close_factor = 1.0 - nearest_pkg_dist / 3.0
+                            pre_pickup_reward = 15.0 * speed_factor * close_factor
                             reward += pre_pickup_reward
 
-                # Low battery penalty (only in dense mode)
+                # Low battery penalty
                 if robot.battery < 0.2 * self.battery_capacity:
                     reward -= 0.5
 
