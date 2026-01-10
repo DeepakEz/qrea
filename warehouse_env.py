@@ -466,9 +466,15 @@ class WarehouseEnv(gym.Env):
                 radius = zone.get('radius', 5.0)
                 spawn_pos = center + np.random.randn(2) * radius * 0.3
             else:
-                # Default: spawn at pickup station
-                pickup_station = [s for s in self.stations if s.type.startswith("pickup")][0]
-                spawn_pos = pickup_station.position + np.random.randn(2) * 0.5
+                # CURRICULUM FIX: Scatter packages across grid for easier discovery
+                # Instead of spawning only at pickup station (too far from robots),
+                # spawn packages randomly throughout the working area
+                # This lets robots naturally encounter packages during exploration
+                margin = 5.0  # Keep away from edges
+                spawn_pos = np.array([
+                    np.random.uniform(margin, self.grid_size[0] - margin),
+                    np.random.uniform(margin, self.grid_size[1] - margin)
+                ], dtype=np.float32)
 
             # Random delivery station
             delivery_stations = [s for s in self.stations if s.type.startswith("delivery")]
@@ -721,18 +727,18 @@ class WarehouseEnv(gym.Env):
 
                     if nearest_pkg_dist < float('inf'):
                         max_dist = np.linalg.norm(self.grid_size)
-                        # CRITICAL FIX: Reduced from 1.0 to 0.05 (20× reduction)
-                        # Now hovering = 50 total, pickup+delivery = 125 total
-                        progress_reward = 0.05 * (1.0 - min(nearest_pkg_dist, max_dist) / max_dist)
+                        # NAVIGATION FIX: Increased from 0.05 to 0.3 for stronger gradient
+                        # With scattered packages, robots need clear signal to approach
+                        progress_reward = 0.3 * (1.0 - min(nearest_pkg_dist, max_dist) / max_dist)
                         reward += progress_reward
 
-                        # PRE-PICKUP REWARD: EXPANDED range (5.0) and reward (30.0)
+                        # PRE-PICKUP REWARD: EXPANDED range (8.0) and reward (50.0)
                         # Teaches agent that approaching + slowing near packages is valuable
-                        if nearest_pkg_dist < 5.0:  # Expanded from 3.0
+                        if nearest_pkg_dist < 8.0:  # Expanded from 5.0
                             # Speed factor works with relaxed threshold (speed < 2.0 for pickup)
                             speed_factor = max(0, 1.0 - robot.speed / 2.0)  # Normalized to new threshold
-                            close_factor = 1.0 - nearest_pkg_dist / 5.0
-                            pre_pickup_reward = 30.0 * speed_factor * close_factor  # Increased from 15.0
+                            close_factor = 1.0 - nearest_pkg_dist / 8.0
+                            pre_pickup_reward = 50.0 * speed_factor * close_factor  # Increased from 30.0
                             reward += pre_pickup_reward
 
                 # Low battery penalty
