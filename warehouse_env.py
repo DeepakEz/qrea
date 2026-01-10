@@ -702,8 +702,10 @@ class WarehouseEnv(gym.Env):
                     pkg = self._get_package(robot.carrying_package)
                     if pkg and not pkg.is_delivered:
                         dist_to_dest = np.linalg.norm(robot.position - pkg.destination)
-                        # FIXED: Reduced from 2.0 to 0.1 (20× reduction)
-                        progress_reward = 0.1 * (1.0 - dist_to_dest / 70.0)
+                        max_dist = np.linalg.norm(self.grid_size)  # ~70m diagonal
+                        # DELIVERY FIX: Increased from 0.1 to 0.5 for stronger delivery signal
+                        # Robots were picking up but not delivering because 0.1 was too weak
+                        progress_reward = 0.5 * (1.0 - dist_to_dest / max_dist)
                         reward += max(0, progress_reward)
                 else:
                     # Not carrying: reward for approaching packages
