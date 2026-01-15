@@ -63,6 +63,114 @@ class Transition(NamedTuple):
     robot_position: Optional[np.ndarray] = None  # For mera_uprt encoder
 
 
+class TrajectoryRecorder:
+    """Records complete world state trajectories for holographic training.
+
+    Used by:
+    - Cosmic Egg: World model pre-training (s, a, s' tuples)
+    - Genome Distillation: Extract agent behavior patterns
+    - Zero-latency: State prediction validation
+
+    Records global_state snapshots at each step when enabled.
+    """
+
+    def __init__(self, capacity: int = 10000, record_every: int = 1):
+        self.capacity = capacity
+        self.record_every = record_every
+        self.buffer: deque = deque(maxlen=capacity)
+        self.step_counter = 0
+        self.enabled = False
+
+    def enable(self, record_every: int = 1):
+        """Enable recording with specified frequency"""
+        self.enabled = True
+        self.record_every = record_every
+
+    def disable(self):
+        """Disable recording"""
+        self.enabled = False
+
+    def record(self, global_state: dict, actions: dict, rewards: dict,
+               phi_q: float, done: bool):
+        """Record a single timestep.
+
+        Args:
+            global_state: From env.get_global_state_snapshot()
+            actions: Dict of robot_id -> action array
+            rewards: Dict of robot_id -> reward
+            phi_q: Current Φ_Q value
+            done: Episode termination flag
+        """
+        if not self.enabled:
+            return
+
+        self.step_counter += 1
+        if self.step_counter % self.record_every != 0:
+            return
+
+        # Convert actions/rewards to arrays for efficient storage
+        num_robots = len(actions)
+        actions_arr = np.array([actions[i] for i in range(num_robots)], dtype=np.float32)
+        rewards_arr = np.array([rewards[i] for i in range(num_robots)], dtype=np.float32)
+
+        record = {
+            'state': global_state,
+            'actions': actions_arr,
+            'rewards': rewards_arr,
+            'phi_q': phi_q,
+            'done': done,
+            'step': self.step_counter,
+        }
+        self.buffer.append(record)
+
+    def get_trajectories(self, num_samples: Optional[int] = None) -> List[dict]:
+        """Get recorded trajectories.
+
+        Args:
+            num_samples: If specified, return random sample of this size
+
+        Returns:
+            List of trajectory records
+        """
+        if num_samples is None or num_samples >= len(self.buffer):
+            return list(self.buffer)
+
+        indices = np.random.choice(len(self.buffer), num_samples, replace=False)
+        return [self.buffer[i] for i in indices]
+
+    def get_state_action_pairs(self) -> Tuple[List[dict], np.ndarray]:
+        """Get (state, action) pairs for world model training.
+
+        Returns:
+            states: List of global state dicts
+            actions: (N, num_robots, action_dim) array
+        """
+        states = [r['state'] for r in self.buffer]
+        actions = np.stack([r['actions'] for r in self.buffer])
+        return states, actions
+
+    def save(self, path: str):
+        """Save trajectories to disk"""
+        import pickle
+        with open(path, 'wb') as f:
+            pickle.dump(list(self.buffer), f)
+
+    def load(self, path: str):
+        """Load trajectories from disk"""
+        import pickle
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        self.buffer = deque(data, maxlen=self.capacity)
+
+    def clear(self):
+        """Clear recorded trajectories"""
+        self.buffer.clear()
+        self.step_counter = 0
+
+    def __len__(self):
+        return len(self.buffer)
+
+
 @dataclass
 class CoordinationMetrics:
     """Metrics for multi-agent coordination quality"""
@@ -603,6 +711,9 @@ class MERAWarehousePPO:
         self.epoch_phi_q = []
         self.epoch_steps = 0
 
+        # Trajectory recording for holographic training (Cosmic Egg, Genome Distillation)
+        self.trajectory_recorder = TrajectoryRecorder(capacity=50000, record_every=1)
+
         # Output
         self.output_dir = Path(f"./results_{encoder_type}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -667,6 +778,17 @@ class MERAWarehousePPO:
             # Execute in environment with SCALED actions
             actions_dict = {i: scaled_actions_np[i] for i in range(self.num_robots)}
             next_obs, rewards, dones, info = self.env.step(actions_dict)
+
+            # Record trajectory for holographic training (if enabled)
+            if self.trajectory_recorder.enabled:
+                global_state = self.env.get_global_state_snapshot()
+                self.trajectory_recorder.record(
+                    global_state=global_state,
+                    actions=actions_dict,
+                    rewards=rewards,
+                    phi_q=phi_q,
+                    done=dones.get('__all__', False)
+                )
 
             # === UPDATE UPRT FIELDS (fix split-brain problem) ===
             if self.encoder_type == 'mera_uprt':
@@ -1057,6 +1179,64 @@ class MERAWarehousePPO:
             'phi_q_history': self.phi_q_history,
             'coordination_history': self.coordination_history,
             'correlation': self.compute_phi_q_correlation(),
+        }
+
+    # =========================================================================
+    # Trajectory Recording for Holographic Training
+    # =========================================================================
+
+    def enable_trajectory_recording(self, record_every: int = 1):
+        """Enable trajectory recording for Cosmic Egg / Genome Distillation.
+
+        Args:
+            record_every: Record every N steps (1 = all, 10 = every 10th)
+        """
+        self.trajectory_recorder.enable(record_every)
+        print(f"  Trajectory recording enabled (every {record_every} steps)")
+
+    def disable_trajectory_recording(self):
+        """Disable trajectory recording"""
+        self.trajectory_recorder.disable()
+
+    def get_recorded_trajectories(self, num_samples: Optional[int] = None) -> List[dict]:
+        """Get recorded trajectories for training world models.
+
+        Args:
+            num_samples: Optional limit on returned samples
+
+        Returns:
+            List of trajectory records with state, actions, rewards, phi_q
+        """
+        return self.trajectory_recorder.get_trajectories(num_samples)
+
+    def save_trajectories(self, path: Optional[str] = None):
+        """Save recorded trajectories to disk.
+
+        Args:
+            path: Save path (default: output_dir/trajectories.pkl)
+        """
+        if path is None:
+            path = str(self.output_dir / "trajectories.pkl")
+        self.trajectory_recorder.save(path)
+        print(f"  Saved {len(self.trajectory_recorder)} trajectories to {path}")
+
+    def get_trajectory_stats(self) -> dict:
+        """Get statistics about recorded trajectories"""
+        n = len(self.trajectory_recorder)
+        if n == 0:
+            return {'count': 0}
+
+        trajectories = self.trajectory_recorder.get_trajectories()
+        phi_q_vals = [t['phi_q'] for t in trajectories]
+        rewards = np.concatenate([t['rewards'] for t in trajectories])
+
+        return {
+            'count': n,
+            'phi_q_mean': float(np.mean(phi_q_vals)),
+            'phi_q_std': float(np.std(phi_q_vals)),
+            'reward_mean': float(np.mean(rewards)),
+            'reward_std': float(np.std(rewards)),
+            'episodes_captured': sum(1 for t in trajectories if t['done']),
         }
 
 

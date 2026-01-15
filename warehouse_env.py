@@ -194,9 +194,10 @@ class WarehouseEnv(gym.Env):
     
     def _create_observation_space(self):
         """Create observation space"""
-        # Robot state (10) + LIDAR (lidar_rays) + Package info (100*4) + Station info (4*3) + Others ((num_robots-1)*8)
+        # Robot state (10) + Carrying dest (4) + LIDAR (lidar_rays) + Package info (100*4) + Station info (4*3) + Others ((num_robots-1)*8)
+        # Carrying dest: rel_pos_x, rel_pos_y, dist, has_dest (4 values)
         others_dim = (self.num_robots - 1) * 8  # Adapts to actual number of robots
-        obs_dim = 10 + self.lidar_rays + 400 + 12 + others_dim
+        obs_dim = 10 + 4 + self.lidar_rays + 400 + 12 + others_dim
         return spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -514,7 +515,7 @@ class WarehouseEnv(gym.Env):
     def _get_observation(self, robot: Robot) -> np.ndarray:
         """Get observation for a robot"""
         obs = []
-        
+
         # Robot state (10)
         obs.extend([
             robot.position[0] / self.grid_size[0],
@@ -528,7 +529,26 @@ class WarehouseEnv(gym.Env):
             1.0 if robot.is_carrying else 0.0,
             robot.speed / self.max_speed
         ])
-        
+
+        # CRITICAL: Carried package destination (4)
+        # This tells the robot WHERE to deliver when carrying
+        # Without this, robots pick up but never know where to go!
+        if robot.carrying_package is not None:
+            pkg = self._get_package(robot.carrying_package)
+            if pkg and pkg.destination is not None:
+                rel_dest = pkg.destination - robot.position
+                dist_to_dest = np.linalg.norm(rel_dest) / np.linalg.norm(self.grid_size)
+                obs.extend([
+                    rel_dest[0] / self.grid_size[0],
+                    rel_dest[1] / self.grid_size[1],
+                    dist_to_dest,
+                    1.0  # has_dest flag
+                ])
+            else:
+                obs.extend([0.0, 0.0, 0.0, 0.0])
+        else:
+            obs.extend([0.0, 0.0, 0.0, 0.0])
+
         # LIDAR (32)
         lidar = self._get_lidar(robot)
         obs.extend(lidar)
@@ -703,10 +723,20 @@ class WarehouseEnv(gym.Env):
                     if pkg and not pkg.is_delivered:
                         dist_to_dest = np.linalg.norm(robot.position - pkg.destination)
                         max_dist = np.linalg.norm(self.grid_size)  # ~70m diagonal
-                        # DELIVERY FIX: Increased from 0.1 to 0.5 for stronger delivery signal
-                        # Robots were picking up but not delivering because 0.1 was too weak
-                        progress_reward = 0.5 * (1.0 - dist_to_dest / max_dist)
+
+                        # CARRYING PROGRESS: Reward moving toward delivery
+                        # Increased from 0.5 to 2.0 for stronger delivery signal
+                        progress_reward = 2.0 * (1.0 - dist_to_dest / max_dist)
                         reward += max(0, progress_reward)
+
+                        # PRE-DELIVERY REWARD: Teaches agent to slow down near delivery
+                        # Same structure as pre-pickup but for delivery zone
+                        # Delivery requires being within 1.5m of destination
+                        if dist_to_dest < 5.0:
+                            speed_factor = max(0, 1.0 - robot.speed)  # Reward slowing down
+                            close_factor = 1.0 - dist_to_dest / 5.0
+                            pre_delivery_reward = 20.0 * speed_factor * close_factor
+                            reward += pre_delivery_reward
                 else:
                     # Not carrying: reward for approaching packages
                     nearest_pkg_dist = float('inf')
@@ -777,4 +807,76 @@ class WarehouseEnv(gym.Env):
             'avg_waiting_time': self.stats['total_waiting_time'] / (self.stats['packages_delivered'] + 1e-6),
             'avg_distance': self.stats['total_distance'] / (self.stats['packages_delivered'] + 1e-6),
             'efficiency': self.stats['packages_delivered'] / (self.stats['total_energy'] + 1e-6)
+        }
+
+    def get_global_state_snapshot(self) -> dict:
+        """Get complete world state snapshot for holographic training.
+
+        Used by:
+        - Cosmic Egg: Global world model pre-training
+        - Genome Distillation: Agent behavior patterns
+        - Zero-latency: State prediction validation
+
+        Returns dict with all state tensors convertible to torch.
+        """
+        # Robot states as numpy arrays for easy torch conversion
+        robot_positions = np.array([r.position for r in self.robots], dtype=np.float32)
+        robot_velocities = np.array([r.velocity for r in self.robots], dtype=np.float32)
+        robot_orientations = np.array([r.orientation for r in self.robots], dtype=np.float32)
+        robot_angular_vels = np.array([r.angular_velocity for r in self.robots], dtype=np.float32)
+        robot_batteries = np.array([r.battery for r in self.robots], dtype=np.float32)
+        robot_carrying = np.array([r.carrying_package if r.carrying_package is not None else -1
+                                   for r in self.robots], dtype=np.int32)
+        robot_delivered = np.array([r.packages_delivered for r in self.robots], dtype=np.int32)
+
+        # Package states (only undelivered)
+        active_packages = [p for p in self.packages if not p.is_delivered]
+        if active_packages:
+            pkg_positions = np.array([p.position for p in active_packages], dtype=np.float32)
+            pkg_destinations = np.array([p.destination for p in active_packages], dtype=np.float32)
+            pkg_priorities = np.array([p.priority.value for p in active_packages], dtype=np.int32)
+            pkg_assigned = np.array([p.assigned_robot if p.assigned_robot is not None else -1
+                                     for p in active_packages], dtype=np.int32)
+            pkg_ids = np.array([p.id for p in active_packages], dtype=np.int32)
+        else:
+            pkg_positions = np.zeros((0, 2), dtype=np.float32)
+            pkg_destinations = np.zeros((0, 2), dtype=np.float32)
+            pkg_priorities = np.zeros(0, dtype=np.int32)
+            pkg_assigned = np.zeros(0, dtype=np.int32)
+            pkg_ids = np.zeros(0, dtype=np.int32)
+
+        # Station states
+        station_positions = np.array([s.position for s in self.stations], dtype=np.float32)
+        station_types = [s.type for s in self.stations]
+
+        return {
+            # Meta
+            'step': self.current_step,
+            'time': self.current_step * self.dt,
+            'grid_size': self.grid_size.copy(),
+
+            # Robots (N_robots, ...)
+            'robot_positions': robot_positions,          # (N, 2)
+            'robot_velocities': robot_velocities,        # (N, 2)
+            'robot_orientations': robot_orientations,    # (N,)
+            'robot_angular_vels': robot_angular_vels,    # (N,)
+            'robot_batteries': robot_batteries,          # (N,)
+            'robot_carrying': robot_carrying,            # (N,) package_id or -1
+            'robot_delivered': robot_delivered,          # (N,) count
+
+            # Packages (N_active_packages, ...)
+            'pkg_positions': pkg_positions,              # (M, 2)
+            'pkg_destinations': pkg_destinations,        # (M, 2)
+            'pkg_priorities': pkg_priorities,            # (M,)
+            'pkg_assigned': pkg_assigned,                # (M,) robot_id or -1
+            'pkg_ids': pkg_ids,                          # (M,)
+            'num_packages_total': len(self.packages),
+            'num_packages_delivered': self.stats['packages_delivered'],
+
+            # Stations
+            'station_positions': station_positions,      # (S, 2)
+            'station_types': station_types,              # list of strings
+
+            # Statistics
+            'stats': copy.deepcopy(self.stats)
         }
