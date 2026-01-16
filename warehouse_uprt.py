@@ -87,8 +87,9 @@ class UPRTField(nn.Module):
         # Calculate obs_dim dynamically based on num_robots
         num_robots = config['environment']['num_robots']
         lidar_rays = config['environment']['sensors']['lidar']['num_rays']
-        # Observation: robot_state(10) + lidar(rays) + packages(400) + stations(12) + other_robots((num_robots-1)*8)
-        obs_dim = 10 + lidar_rays + 400 + 12 + (num_robots - 1) * 8
+        # Observation: robot_state(10) + carrying_dest(4) + lidar(rays) + packages(400) + stations(12) + other_robots((num_robots-1)*8)
+        # NOTE: +4 for carrying destination added in warehouse_env.py observation fix
+        obs_dim = 10 + 4 + lidar_rays + 400 + 12 + (num_robots - 1) * 8
         self.pattern_encoder = nn.Sequential(
             nn.Linear(obs_dim, 512),
             nn.ReLU(),

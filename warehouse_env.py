@@ -211,6 +211,7 @@ class WarehouseEnv(gym.Env):
         self.episode_reward = 0.0
         self.next_package_id = 0
         self._just_delivered = {}  # Track deliveries for reward calculation
+        self._prev_dist_to_dest = {}  # Track previous distance for delta-based progress reward
         
         # Reset robots
         self.robots = []
@@ -398,12 +399,15 @@ class WarehouseEnv(gym.Env):
                     # Check if at destination
                     dist = np.linalg.norm(robot.position - pkg.destination)
                     if dist < 1.5:  # Within delivery range
+                        pkg.is_delivered = True  # CRITICAL: Mark package as delivered!
                         pkg.delivery_time = self.current_step * self.dt
                         self._just_delivered[robot.id] = pkg.reward  # Track for reward
                         robot.carrying_package = None
                         robot.packages_delivered += 1
                         self.stats['packages_delivered'] += 1
                         self.stats['total_waiting_time'] += pkg.waiting_time
+                        # Debug: Log successful delivery
+                        # print(f"  [DELIVERY] Robot {robot.id} delivered pkg {pkg.id} (reward={pkg.reward})")
     
     def _try_pickup_or_deliver(self, robot: Robot):
         """Try to pick up or deliver a package"""
@@ -718,19 +722,23 @@ class WarehouseEnv(gym.Env):
             # === DENSE SHAPING (only in dense mode) ===
             if not self.sparse_rewards:
                 if robot.carrying_package is not None:
-                    # Carrying package: reward for moving toward destination
+                    # Carrying package: reward for PROGRESS toward destination (delta-based)
                     pkg = self._get_package(robot.carrying_package)
                     if pkg and not pkg.is_delivered:
                         dist_to_dest = np.linalg.norm(robot.position - pkg.destination)
-                        max_dist = np.linalg.norm(self.grid_size)  # ~70m diagonal
 
-                        # CARRYING PROGRESS: Reward moving toward delivery
-                        # Increased from 0.5 to 2.0 for stronger delivery signal
-                        progress_reward = 2.0 * (1.0 - dist_to_dest / max_dist)
-                        reward += max(0, progress_reward)
+                        # DELTA-BASED PROGRESS REWARD (fixes hoarding bug)
+                        # Reward MOVEMENT toward destination, not just proximity
+                        prev_dist = self._prev_dist_to_dest.get(robot.id, dist_to_dest)
+                        progress_delta = prev_dist - dist_to_dest  # Positive if closer
+                        self._prev_dist_to_dest[robot.id] = dist_to_dest
+
+                        # Scale: ~5.0 reward per meter moved toward destination
+                        # Max speed 2.0 m/s * dt 0.1 = 0.2m/step = 1.0 reward/step at max delivery speed
+                        progress_reward = 5.0 * progress_delta
+                        reward += progress_reward  # Can be negative if moving away!
 
                         # PRE-DELIVERY REWARD: Teaches agent to slow down near delivery
-                        # Same structure as pre-pickup but for delivery zone
                         # Delivery requires being within 1.5m of destination
                         if dist_to_dest < 5.0:
                             speed_factor = max(0, 1.0 - robot.speed)  # Reward slowing down
@@ -738,6 +746,9 @@ class WarehouseEnv(gym.Env):
                             pre_delivery_reward = 20.0 * speed_factor * close_factor
                             reward += pre_delivery_reward
                 else:
+                    # Clear prev_dist when not carrying
+                    if robot.id in self._prev_dist_to_dest:
+                        del self._prev_dist_to_dest[robot.id]
                     # Not carrying: reward for approaching packages
                     nearest_pkg_dist = float('inf')
                     for pkg in self.packages:
