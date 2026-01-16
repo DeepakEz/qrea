@@ -212,6 +212,8 @@ class WarehouseEnv(gym.Env):
         self.next_package_id = 0
         self._just_delivered = {}  # Track deliveries for reward calculation
         self._prev_dist_to_dest = {}  # Track previous distance for delta-based progress reward
+        self._progress_history = {}  # Track progress over window to prevent oscillation
+        self._steps_carrying = {}  # Track steps carrying for stall detection
         
         # Reset robots
         self.robots = []
@@ -737,11 +739,29 @@ class WarehouseEnv(gym.Env):
                         progress_delta = prev_dist - dist_to_dest  # Positive if closer
                         self._prev_dist_to_dest[robot.id] = dist_to_dest
 
+                        # Track progress history to detect oscillation/stalling
+                        if robot.id not in self._progress_history:
+                            self._progress_history[robot.id] = []
+                            self._steps_carrying[robot.id] = 0
+                        self._progress_history[robot.id].append(progress_delta)
+                        self._steps_carrying[robot.id] += 1
+
+                        # Keep only last 20 steps of history
+                        if len(self._progress_history[robot.id]) > 20:
+                            self._progress_history[robot.id].pop(0)
+
                         # Scale: ~15.0 reward per meter moved toward destination
-                        # Max speed 2.0 m/s * dt 0.1 = 0.2m/step = 3.0 reward/step at max delivery speed
-                        # Strong enough signal for agents to learn goal-directed movement
                         progress_reward = 15.0 * progress_delta
                         reward += progress_reward  # Can be negative if moving away!
+
+                        # ANTI-OSCILLATION: Penalize if net progress over window is near zero
+                        # This prevents agents from oscillating to harvest rewards
+                        if len(self._progress_history[robot.id]) >= 10:
+                            net_progress = sum(self._progress_history[robot.id][-10:])
+                            if abs(net_progress) < 0.5:  # Less than 0.5m net progress in 10 steps
+                                # Apply stall penalty - grows with time carrying
+                                stall_penalty = 0.5 * min(self._steps_carrying[robot.id] / 100, 1.0)
+                                reward -= stall_penalty
 
                         # PRE-DELIVERY REWARD: Teaches agent to slow down near delivery
                         # Delivery requires being within 1.5m of destination
@@ -752,9 +772,13 @@ class WarehouseEnv(gym.Env):
                             pre_delivery_reward = 30.0 * speed_factor * close_factor
                             reward += pre_delivery_reward
                 else:
-                    # Clear prev_dist when not carrying
+                    # Clear tracking when not carrying
                     if robot.id in self._prev_dist_to_dest:
                         del self._prev_dist_to_dest[robot.id]
+                    if robot.id in self._progress_history:
+                        del self._progress_history[robot.id]
+                    if robot.id in self._steps_carrying:
+                        del self._steps_carrying[robot.id]
                     # Not carrying: reward for approaching packages
                     nearest_pkg_dist = float('inf')
                     for pkg in self.packages:

@@ -370,7 +370,7 @@ class SpatioTemporalEncoder(nn.Module):
     """Combined UPRT (spatial) + MERA (temporal) encoder.
 
     Fixes the "split brain" problem by connecting:
-    - UPRT fields: spatial pattern fields (consciousness, resonance, genetic)
+    - UPRT fields: spatial activity accumulators (activity, interaction, memory)
     - MERA: temporal hierarchical encoding
 
     The spatial features from UPRT fields are combined with MERA's temporal
@@ -385,9 +385,10 @@ class SpatioTemporalEncoder(nn.Module):
         self.device = device
 
         # Store world grid size from config (for position normalization)
-        self.world_grid_size = torch.tensor(
+        # Register as buffer for proper device handling
+        self.register_buffer('world_grid_size', torch.tensor(
             config['environment']['grid_size'], dtype=torch.float32
-        )
+        ))
 
         # Temporal encoder (MERA)
         self.mera_encoder = MERAEncoder(obs_dim, history_len, mera_config)
@@ -395,7 +396,7 @@ class SpatioTemporalEncoder(nn.Module):
 
         # Spatial encoder (UPRT field sampling)
         self.uprt_field = UPRTField(config)
-        # UPRT fields: consciousness(16) + resonance(16) + genetic(32) = 64 channels
+        # UPRT fields: activity(16) + interaction(16) + memory(32) = 64 channels
         spatial_dim = 64
 
         # Spatial feature projection
@@ -434,11 +435,11 @@ class SpatioTemporalEncoder(nn.Module):
         grid_y = (normalized[:, 1] * (grid_size[1] - 1)).long().clamp(0, grid_size[1] - 1)
 
         # Sample from each field
-        consciousness = self.uprt_field.consciousness_field[grid_x, grid_y]  # (batch, 16)
-        resonance = self.uprt_field.resonance_field[grid_x, grid_y]  # (batch, 16)
-        genetic = self.uprt_field.genetic_field[grid_x, grid_y]  # (batch, 32)
+        activity = self.uprt_field.activity_field[grid_x, grid_y]  # (batch, 16)
+        interaction = self.uprt_field.interaction_field[grid_x, grid_y]  # (batch, 16)
+        memory = self.uprt_field.memory_field[grid_x, grid_y]  # (batch, 32)
 
-        return torch.cat([consciousness, resonance, genetic], dim=-1)  # (batch, 64)
+        return torch.cat([activity, interaction, memory], dim=-1)  # (batch, 64)
 
     def forward(self, obs_history: torch.Tensor,
                 robot_positions: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
@@ -1264,11 +1265,15 @@ def main():
     parser.add_argument('--quick_test', action='store_true')
     args = parser.parse_args()
 
-    # Set seed if provided
+    # Set seed if provided for reproducibility
     if args.seed is not None:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
-        print(f"Random seed: {args.seed}")
+        # Enable deterministic operations for reproducibility
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # Note: torch.use_deterministic_algorithms(True) may cause errors with some operations
+        print(f"Random seed: {args.seed} (deterministic mode enabled)")
 
     epochs = 5 if args.quick_test else args.epochs
 

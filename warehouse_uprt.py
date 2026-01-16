@@ -56,19 +56,19 @@ class UPRTField(nn.Module):
         self.decay_rate = uprt_cfg['field']['decay_rate']
         self.update_rate = uprt_cfg['field']['update_rate']
 
-        # World grid size from config (NOT hardcoded 50.0)
-        self.world_size = torch.tensor(
+        # World grid size from config - registered as buffer for proper device handling
+        self.register_buffer('world_size', torch.tensor(
             config['environment']['grid_size'], dtype=torch.float32
-        )
-        
+        ))
+
         # Field grids [H, W, channels] - registered as buffers for proper device handling
-        self.register_buffer('consciousness_field', torch.zeros(
+        self.register_buffer('activity_field', torch.zeros(
             *self.grid_resolution, 16, requires_grad=False
         ))
-        self.register_buffer('resonance_field', torch.zeros(
+        self.register_buffer('interaction_field', torch.zeros(
             *self.grid_resolution, 16, requires_grad=False
         ))
-        self.register_buffer('genetic_field', torch.zeros(
+        self.register_buffer('memory_field', torch.zeros(
             *self.grid_resolution, 32, requires_grad=False
         ))
         
@@ -98,8 +98,8 @@ class UPRTField(nn.Module):
             nn.Linear(256, self.symbol_dim)
         )
         
-        # Resonance computation
-        self.resonance_net = nn.Sequential(
+        # Similarity computation network for interaction field
+        self.similarity_net = nn.Sequential(
             nn.Linear(self.symbol_dim * 2, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
@@ -131,24 +131,24 @@ class UPRTField(nn.Module):
         grid_x = torch.clamp(grid_x, 0, self.grid_resolution[0] - 1)
         grid_y = torch.clamp(grid_y, 0, self.grid_resolution[1] - 1)
         
-        # Update consciousness field (agent awareness)
+        # Update activity field (spatial activity accumulator)
         for i in range(robot_positions.shape[0]):
             x, y = grid_x[i], grid_y[i]
-            self.consciousness_field[x, y] += robot_activities[i, :16] * dt
+            self.activity_field[x, y] += robot_activities[i, :16] * dt
         
         # Diffusion
-        self.consciousness_field = self._apply_diffusion(
-            self.consciousness_field, self.diffusion_coeff, dt
+        self.activity_field = self._apply_diffusion(
+            self.activity_field, self.diffusion_coeff, dt
         )
         
         # Decay
-        self.consciousness_field *= (1 - self.decay_rate * dt)
+        self.activity_field *= (1 - self.decay_rate * dt)
         
-        # Update resonance field
-        self._update_resonance_field(robot_positions, robot_activities, dt)
-        
-        # Update genetic field (inherited patterns)
-        self._update_genetic_field(robot_positions, robot_activities, dt)
+        # Update interaction field (pairwise proximity/similarity)
+        self._update_interaction_field(robot_positions, robot_activities, dt)
+
+        # Update memory field (long-term activity accumulation)
+        self._update_memory_field(robot_positions, robot_activities, dt)
         
         self.timestep += 1
     
@@ -174,16 +174,16 @@ class UPRTField(nn.Module):
         
         return diffused.permute(1, 2, 0)
     
-    def _update_resonance_field(self, positions: torch.Tensor,
+    def _update_interaction_field(self, positions: torch.Tensor,
                                activities: torch.Tensor, dt: float):
-        """Update resonance field based on agent interactions (vectorized)"""
+        """Update interaction field based on pairwise robot proximity/similarity (vectorized)"""
         N = positions.shape[0]
         if N < 2:
             # No pairs to process
-            self.resonance_field = self._apply_diffusion(
-                self.resonance_field, self.diffusion_coeff * 2, dt
+            self.interaction_field = self._apply_diffusion(
+                self.interaction_field, self.diffusion_coeff * 2, dt
             )
-            self.resonance_field *= (1 - self.decay_rate * 0.5 * dt)
+            self.interaction_field *= (1 - self.decay_rate * 0.5 * dt)
             return
 
         # Vectorized pairwise distance computation - O(N²) but in parallel
@@ -224,18 +224,18 @@ class UPRTField(nn.Module):
             # Scatter add resonances to field (vectorized)
             # Use index_add_ for accumulation at grid positions
             for idx in range(len(gx)):
-                self.resonance_field[gx[idx], gy[idx]] += resonances[idx] * dt
+                self.interaction_field[gx[idx], gy[idx]] += resonances[idx] * dt
 
         # Diffuse and decay
-        self.resonance_field = self._apply_diffusion(
-            self.resonance_field, self.diffusion_coeff * 2, dt
+        self.interaction_field = self._apply_diffusion(
+            self.interaction_field, self.diffusion_coeff * 2, dt
         )
-        self.resonance_field *= (1 - self.decay_rate * 0.5 * dt)
+        self.interaction_field *= (1 - self.decay_rate * 0.5 * dt)
     
-    def _update_genetic_field(self, positions: torch.Tensor,
+    def _update_memory_field(self, positions: torch.Tensor,
                              activities: torch.Tensor, dt: float):
-        """Update genetic field (inherited behavioral patterns)"""
-        # Genetic field accumulates successful patterns
+        """Update memory field (long-term activity accumulation with slow decay)"""
+        # Memory field accumulates activity patterns over time
         world_size = self.world_size.to(positions.device)
         for i in range(positions.shape[0]):
             gx = int(positions[i, 0] / world_size[0].item() * self.grid_resolution[0])
@@ -245,24 +245,24 @@ class UPRTField(nn.Module):
             gy = np.clip(gy, 0, self.grid_resolution[1] - 1)
             
             # Accumulate pattern
-            self.genetic_field[gx, gy] += activities[i, :32] * dt * 0.1
+            self.memory_field[gx, gy] += activities[i, :32] * dt * 0.1
         
-        # Slower decay for genetic memory
-        self.genetic_field *= (1 - self.decay_rate * 0.1 * dt)
+        # Slower decay for long-term memory
+        self.memory_field *= (1 - self.decay_rate * 0.1 * dt)
     
-    def _compute_resonance(self, act1: torch.Tensor, act2: torch.Tensor) -> torch.Tensor:
-        """Compute resonance between two activity patterns"""
+    def _compute_similarity(self, act1: torch.Tensor, act2: torch.Tensor) -> torch.Tensor:
+        """Compute similarity between two activity patterns"""
         # Normalize
         act1_norm = act1 / (torch.norm(act1) + 1e-8)
         act2_norm = act2 / (torch.norm(act2) + 1e-8)
-        
+
         # Cosine similarity
         similarity = torch.dot(act1_norm[:16], act2_norm[:16])
-        
-        # Transform to resonance
-        resonance = torch.sigmoid(similarity * 5.0)  # Sharpen
-        
-        return resonance.unsqueeze(-1).expand(16)
+
+        # Transform to [0,1] range with sigmoid
+        sim_score = torch.sigmoid(similarity * 5.0)  # Sharpen
+
+        return sim_score.unsqueeze(-1).expand(16)
     
     def detect_patterns(self, observations: torch.Tensor) -> Tuple[torch.Tensor, List[int]]:
         """
@@ -337,21 +337,21 @@ class UPRTField(nn.Module):
         return symbol
     
     def compute_field_coherence(self) -> float:
-        """Compute global field coherence"""
+        """Compute global field structure (variance-based measure)"""
         # Measure how organized/structured the fields are
-        
-        # Consciousness field coherence
-        c_field_flat = self.consciousness_field.flatten()
-        c_variance = c_field_flat.var().item()
-        
-        # Resonance field coherence
-        r_field_flat = self.resonance_field.flatten()
-        r_variance = r_field_flat.var().item()
-        
-        # High variance = high coherence (structured)
-        coherence = (c_variance + r_variance) / 2
-        
-        return coherence
+
+        # Activity field variance
+        a_field_flat = self.activity_field.flatten()
+        a_variance = a_field_flat.var().item()
+
+        # Interaction field variance
+        i_field_flat = self.interaction_field.flatten()
+        i_variance = i_field_flat.var().item()
+
+        # High variance = more structure (localized activity rather than uniform)
+        structure = (a_variance + i_variance) / 2
+
+        return structure
     
     def get_field_at_position(self, position: np.ndarray) -> Dict[str, torch.Tensor]:
         """Get field values at world position"""
@@ -363,17 +363,17 @@ class UPRTField(nn.Module):
         gy = np.clip(gy, 0, self.grid_resolution[1] - 1)
         
         return {
-            'consciousness': self.consciousness_field[gx, gy].clone(),
-            'resonance': self.resonance_field[gx, gy].clone(),
-            'genetic': self.genetic_field[gx, gy].clone()
+            'activity': self.activity_field[gx, gy].clone(),
+            'interaction': self.interaction_field[gx, gy].clone(),
+            'memory': self.memory_field[gx, gy].clone()
         }
     
     def visualize_fields(self) -> Dict[str, np.ndarray]:
         """Get field visualizations"""
         return {
-            'consciousness': self.consciousness_field.norm(dim=-1).cpu().numpy(),
-            'resonance': self.resonance_field.norm(dim=-1).cpu().numpy(),
-            'genetic': self.genetic_field.norm(dim=-1).cpu().numpy()
+            'activity': self.activity_field.norm(dim=-1).cpu().numpy(),
+            'interaction': self.interaction_field.norm(dim=-1).cpu().numpy(),
+            'memory': self.memory_field.norm(dim=-1).cpu().numpy()
         }
     
     def get_symbol_statistics(self) -> Dict:
@@ -417,9 +417,9 @@ class UPRTField(nn.Module):
     
     def reset(self):
         """Reset fields"""
-        self.consciousness_field.zero_()
-        self.resonance_field.zero_()
-        self.genetic_field.zero_()
+        self.activity_field.zero_()
+        self.interaction_field.zero_()
+        self.memory_field.zero_()
         self.symbols = []
         self.timestep = 0
 
@@ -480,9 +480,9 @@ class WarehouseUPRT:
         
         # Concatenate field values
         obs = torch.cat([
-            fields['consciousness'],
-            fields['resonance'][:8],  # Subsample
-            fields['genetic'][:16]    # Subsample
+            fields['activity'],
+            fields['interaction'][:8],  # Subsample
+            fields['memory'][:16]       # Subsample
         ])
         
         return obs.cpu().numpy()
