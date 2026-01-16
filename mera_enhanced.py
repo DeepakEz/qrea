@@ -40,6 +40,7 @@ class EnhancedMERAConfig:
     bond_dim: int = 8                # χ: bond dimension (entanglement capacity)
     physical_dim: int = 4            # d: physical dimension at input
     temporal_window: int = 50
+    default_input_dim: int = 514     # Default input dimension (warehouse obs_dim)
 
     # Tensor network constraints
     enforce_isometry: bool = True
@@ -132,9 +133,13 @@ class TrueDisentangler(nn.Module):
         combined = torch.einsum('ijkl,bi,bj->bkl', self.tensor, site1, site2)
 
         # Split into two sites using learned projections
-        # Project along each dimension
-        out1 = torch.einsum('bkl,kk->bl', combined, self.proj_left)   # (batch, d_out)
-        out2 = torch.einsum('bkl,ll->bk', combined, self.proj_right)  # (batch, d_out)
+        # FIX: Use proper matrix multiplication, not diagonal-only indexing
+        # Old (buggy): 'bkl,kk->bl' only used diagonal elements of proj_left
+        # New: proper contraction - project combined tensor to output vectors
+        # out1: contract over k with proj_left, average over l
+        # out2: contract over l with proj_right, average over k
+        out1 = torch.einsum('bkl,km->bm', combined, self.proj_left) / self.d_out  # (batch, d_out)
+        out2 = torch.einsum('bkl,lm->bm', combined, self.proj_right) / self.d_out  # (batch, d_out)
 
         return out1, out2
 
@@ -153,9 +158,9 @@ class TrueDisentangler(nn.Module):
         # Contract: u_{ijkl} × sites_even_{p,b,i} × sites_odd_{p,b,j} → combined_{p,b,k,l}
         combined = torch.einsum('ijkl,pbi,pbj->pbkl', self.tensor, sites_even, sites_odd)
 
-        # Split using projections
-        out_even = torch.einsum('pbkl,kk->pbl', combined, self.proj_left)
-        out_odd = torch.einsum('pbkl,ll->pbk', combined, self.proj_right)
+        # Split using projections (FIX: proper matrix contraction, not diagonal-only)
+        out_even = torch.einsum('pbkl,km->pbm', combined, self.proj_left) / self.d_out
+        out_odd = torch.einsum('pbkl,lm->pbm', combined, self.proj_right) / self.d_out
 
         return out_even, out_odd
 
@@ -445,11 +450,22 @@ class EnhancedTensorNetworkMERA(nn.Module):
         ])
 
         # Input embedding: input_dim → physical_dim
-        self.input_embedding = None
+        # FIX: Create at init to ensure parameters are in optimizer
+        self.input_embedding = nn.Sequential(
+            nn.Linear(config.default_input_dim, self.physical_dim * 2),
+            nn.GELU(),
+            nn.Linear(self.physical_dim * 2, self.physical_dim),
+            nn.LayerNorm(self.physical_dim),
+        )
+        self._current_input_dim = config.default_input_dim
 
         # Output projection (bond_dim * 2 matches typical final layer output of 2 sites)
         self.output_dim = config.bond_dim * 2
-        self.output_projection = None
+        # FIX: Create at init to ensure parameters are in optimizer
+        self.output_projection = nn.Sequential(
+            nn.Linear(self.output_dim, self.output_dim),
+            nn.LayerNorm(self.output_dim),
+        )
 
         # Hierarchical entropy computation (diagnostic probe only - no gradients)
         self.entropy_computer = HierarchicalEntropyComputer()
@@ -482,20 +498,36 @@ class EnhancedTensorNetworkMERA(nn.Module):
         return min(1.0, self.current_step / warmup_steps)
 
     def _ensure_input_embedding(self, input_dim: int, device: torch.device):
-        if self.input_embedding is None or self.input_embedding[0].in_features != input_dim:
+        """Ensure input embedding matches input dimension.
+
+        NOTE: If input_dim differs from init, we create a new embedding.
+        This is a fallback - ideally input_dim should match config.default_input_dim.
+        New embedding will be on correct device but won't be optimized until
+        optimizer is recreated (which we avoid by using correct default_input_dim).
+        """
+        if self._current_input_dim != input_dim:
+            import warnings
+            warnings.warn(
+                f"Input dim {input_dim} differs from default {self._current_input_dim}. "
+                "Creating new embedding - this may not be optimized correctly. "
+                "Consider updating config.default_input_dim."
+            )
             self.input_embedding = nn.Sequential(
                 nn.Linear(input_dim, self.physical_dim * 2),
                 nn.GELU(),
                 nn.Linear(self.physical_dim * 2, self.physical_dim),
                 nn.LayerNorm(self.physical_dim),
             ).to(device)
+            self._current_input_dim = input_dim
 
     def _ensure_output_projection(self, final_dim: int, device: torch.device):
-        if self.output_projection is None or self.output_projection[0].in_features != final_dim:
-            self.output_projection = nn.Sequential(
-                nn.Linear(final_dim, self.output_dim),
-                nn.LayerNorm(self.output_dim),
-            ).to(device)
+        """Ensure output projection matches final dimension.
+
+        NOTE: Output projection is created in __init__ with fixed dimensions.
+        This method is now a no-op since we pre-create the projection.
+        """
+        # Output projection has fixed output_dim, no need to recreate
+        pass
 
     def encode_sequence(self, sequence: torch.Tensor) -> List[torch.Tensor]:
         """Encode sequence to physical_dim sites"""

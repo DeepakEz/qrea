@@ -173,7 +173,10 @@ class TrajectoryRecorder:
 
 @dataclass
 class CoordinationMetrics:
-    """Metrics for multi-agent coordination quality"""
+    """Metrics for multi-agent coordination quality.
+
+    FIX: All metrics are now normalized by num_robots for fair scaling studies.
+    """
     total_collisions: int = 0
     packages_delivered: int = 0
     packages_picked_up: int = 0
@@ -182,20 +185,45 @@ class CoordinationMetrics:
     episode_length: int = 0
     throughput: float = 0.0
     avg_waiting_time: float = 0.0
+    num_robots: int = 1  # Added for normalization
 
     @property
     def collision_rate(self) -> float:
+        """Collisions per step (not normalized by robots - collisions are O(N²))"""
         return self.total_collisions / max(self.episode_length, 1)
+
+    @property
+    def collision_rate_per_robot(self) -> float:
+        """Collisions per robot per step - normalized for scaling studies"""
+        # Collisions are pairwise events, scale as O(N²) potential pairs
+        # Normalize by N*(N-1)/2 potential collision pairs
+        potential_pairs = max(self.num_robots * (self.num_robots - 1) / 2, 1)
+        return self.total_collisions / (potential_pairs * max(self.episode_length, 1))
 
     @property
     def efficiency(self) -> float:
         return self.packages_delivered / max(self.total_energy, 0.001)
 
     @property
+    def efficiency_per_robot(self) -> float:
+        """Per-robot efficiency - normalized for scaling studies"""
+        return self.efficiency / max(self.num_robots, 1)
+
+    @property
+    def throughput_per_robot(self) -> float:
+        """Packages delivered per robot per hour"""
+        return self.throughput / max(self.num_robots, 1)
+
+    @property
     def synergy_score(self) -> float:
-        """Higher when robots work together well"""
-        collision_penalty = 1.0 / (1.0 + self.total_collisions)
-        throughput_bonus = min(self.throughput / 100.0, 1.0)
+        """Higher when robots work together well.
+
+        FIX: Now uses normalized collision rate so score is comparable across robot counts.
+        """
+        # Use per-robot-pair collision rate for fair scaling
+        collision_penalty = 1.0 / (1.0 + self.collision_rate_per_robot * 100)
+        # Use per-robot throughput
+        throughput_bonus = min(self.throughput_per_robot / 10.0, 1.0)
         return (collision_penalty + throughput_bonus) / 2.0
 
 
@@ -204,7 +232,11 @@ class CoordinationMetrics:
 # =============================================================================
 
 class MLPEncoder(nn.Module):
-    """Baseline MLP encoder for comparison"""
+    """Baseline MLP encoder for comparison.
+
+    NOTE: MLP flattens temporal history, losing structure. For fair comparison,
+    we compute a representation coherence metric based on output activation patterns.
+    """
 
     def __init__(self, input_dim: int, output_dim: int, hidden_dims: List[int] = [256, 256]):
         super().__init__()
@@ -220,7 +252,19 @@ class MLPEncoder(nn.Module):
         self.output_dim = output_dim
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
-        return self.net(x), {'phi_q': torch.zeros(x.shape[0], device=x.device)}
+        latent = self.net(x)
+
+        # Compute representation coherence (analogous to phi_q)
+        # For MLP, measure how "structured" the output is via activation sparsity
+        with torch.no_grad():
+            # Normalized activation magnitude variance (higher = more structured)
+            latent_norm = F.normalize(latent, dim=-1)
+            # Variance of squared activations (Gini-like sparsity)
+            coherence = latent_norm.pow(2).var(dim=-1)  # (B,)
+            # Scale to reasonable range [0, 1]
+            coherence = torch.clamp(coherence * 10, 0, 1)
+
+        return latent, {'phi_q': coherence.detach()}
 
 
 class GRUEncoder(nn.Module):
@@ -266,7 +310,19 @@ class GRUEncoder(nn.Module):
         latent = h_n[-1]  # (B, H)
         latent = self.output_projection(latent)
 
-        return latent, {'phi_q': torch.zeros(obs_history.shape[0], device=obs_history.device)}
+        # Compute temporal coherence metric (analogous to phi_q for fair comparison)
+        # Measures correlation between hidden states across time
+        with torch.no_grad():
+            # Compute correlation between first and last half of sequence
+            T = gru_out.shape[1]
+            first_half = gru_out[:, :T//2, :].mean(dim=1)  # (B, H)
+            second_half = gru_out[:, T//2:, :].mean(dim=1)  # (B, H)
+            # Cosine similarity as coherence measure
+            coherence = F.cosine_similarity(first_half, second_half, dim=-1)  # (B,)
+            # Map to [0, 1] range
+            temporal_coherence = (coherence + 1) / 2
+
+        return latent, {'phi_q': temporal_coherence.detach()}
 
 
 class TransformerEncoder(nn.Module):
@@ -329,7 +385,20 @@ class TransformerEncoder(nn.Module):
         latent = x.mean(dim=1)  # (B, d_model)
         latent = self.output_projection(latent)
 
-        return latent, {'phi_q': torch.zeros(batch_size, device=obs_history.device)}
+        # Compute temporal coherence metric (analogous to phi_q for fair comparison)
+        # Measures how structured/correlated the transformer output is across time
+        with torch.no_grad():
+            # Compute pairwise cosine similarity between time steps
+            x_norm = F.normalize(x, dim=-1)  # (B, T, d_model)
+            # Self-similarity matrix
+            sim_matrix = torch.bmm(x_norm, x_norm.transpose(1, 2))  # (B, T, T)
+            # Average off-diagonal similarity (temporal coherence)
+            mask = ~torch.eye(seq_len, dtype=torch.bool, device=x.device)
+            temporal_coherence = sim_matrix[:, mask].mean(dim=-1)  # (B,)
+            # Already in [-1, 1], map to [0, 1]
+            temporal_coherence = (temporal_coherence + 1) / 2
+
+        return latent, {'phi_q': temporal_coherence.detach()}
 
 
 class MERAEncoder(nn.Module):
@@ -572,8 +641,11 @@ class PPOActorCritic(nn.Module):
         action_mean = self.actor_mean(actor_features)
         value = self.critic(latent).squeeze(-1)
 
-        if self.encoder_type == "mera" and aux['phi_q'] is not None:
-            value = value + self.phi_q_value_weight * aux['phi_q']
+        # NOTE: phi_q is now diagnostic-only, NOT used in value function
+        # This ensures fair comparison between MERA and baselines
+        # Previous code added phi_q to value for MERA only, creating unfair advantage
+        # if self.encoder_type == "mera" and aux['phi_q'] is not None:
+        #     value = value + self.phi_q_value_weight * aux['phi_q']
 
         return action_mean, value, aux
 
@@ -852,6 +924,7 @@ class MERAWarehousePPO:
                     episode_length=episode_steps,
                     throughput=env_stats['throughput'],
                     avg_waiting_time=env_stats.get('avg_waiting_time', 0),
+                    num_robots=self.num_robots,  # Added for normalized metrics
                 )
 
                 self.coordination_history.append(asdict(metrics))
