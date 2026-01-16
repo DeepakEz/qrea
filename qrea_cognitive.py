@@ -12,11 +12,22 @@ The cognitive layer sits ABOVE the reactive MERA-PPO layer:
 - MERA-PPO: Low-level control (motion, gripper, immediate reactions)
 - Cognitive: High-level planning (task allocation, coordination, learning)
 
+Upgrade Phases (holographic module):
+- Phase 3: LearnedEpisodicMemory (contrastive embeddings)
+- Phase 4: NeuralDoctrineEngine (neural pattern recognition)
+
 Usage:
     from qrea_cognitive import CognitiveQREATrainer
 
+    # Basic cognitive training
     trainer = CognitiveQREATrainer(config_path='config.yaml')
     trainer.train(epochs=100)
+
+    # With Phase 3 upgrades (learned embeddings)
+    trainer = CognitiveQREATrainer(use_learned_embeddings=True)
+
+    # With Phase 4 upgrades (neural doctrines)
+    trainer = CognitiveQREATrainer(use_neural_doctrines=True)
 """
 
 import torch
@@ -458,13 +469,28 @@ class CognitiveAgent:
     - Semantic knowledge about the environment
     - Doctrine-based coordination
     - Communication with other agents
+
+    Upgrade options:
+    - use_learned_embeddings: Use contrastive learned embeddings (Phase 3)
     """
 
-    def __init__(self, agent_id: int, memory_capacity: int = 5000):
+    def __init__(self, agent_id: int, memory_capacity: int = 5000,
+                 use_learned_embeddings: bool = False,
+                 obs_dim: int = 514, action_dim: int = 3):
         self.agent_id = agent_id
+        self.use_learned_embeddings = use_learned_embeddings
 
-        # Memory systems
-        self.episodic_memory = EpisodicMemory(capacity=memory_capacity)
+        # Memory systems - choose between simple and learned
+        if use_learned_embeddings:
+            from holographic.learned_memory import LearnedEpisodicMemory
+            self.episodic_memory = LearnedEpisodicMemory(
+                obs_dim=obs_dim,
+                action_dim=action_dim,
+                capacity=memory_capacity
+            )
+        else:
+            self.episodic_memory = EpisodicMemory(capacity=memory_capacity)
+
         self.semantic_memory = SemanticMemory()
 
         # State tracking
@@ -574,17 +600,25 @@ class CognitiveQREATrainer:
     1. Base: MERAWarehousePPO (reactive control)
     2. Cognitive: Memory + Doctrines (learning from experience)
     3. Social: Inter-agent communication (coordination)
+
+    Upgrade options:
+    - use_learned_embeddings: Phase 3 - Contrastive learned memory embeddings
+    - use_neural_doctrines: Phase 4 - Neural pattern recognition for doctrines
     """
 
     def __init__(self, config_path: str = 'config.yaml',
                  encoder_type: str = 'mera',
                  enable_doctrines: bool = True,
-                 enable_communication: bool = True):
+                 enable_communication: bool = True,
+                 use_learned_embeddings: bool = False,
+                 use_neural_doctrines: bool = False):
 
         self.config_path = config_path
         self.encoder_type = encoder_type
         self.enable_doctrines = enable_doctrines
         self.enable_communication = enable_communication
+        self.use_learned_embeddings = use_learned_embeddings
+        self.use_neural_doctrines = use_neural_doctrines
 
         # Initialize base trainer
         self.base_trainer = MERAWarehousePPO(
@@ -593,14 +627,26 @@ class CognitiveQREATrainer:
         )
 
         self.num_robots = self.base_trainer.num_robots
+        self.obs_dim = self.base_trainer.obs_dim
+        self.action_dim = self.base_trainer.action_dim
 
-        # Create cognitive agents
+        # Create cognitive agents (with optional learned embeddings)
         self.cognitive_agents: Dict[int, CognitiveAgent] = {
-            i: CognitiveAgent(agent_id=i) for i in range(self.num_robots)
+            i: CognitiveAgent(
+                agent_id=i,
+                use_learned_embeddings=use_learned_embeddings,
+                obs_dim=self.obs_dim,
+                action_dim=self.action_dim
+            ) for i in range(self.num_robots)
         }
 
-        # Shared doctrine engine
-        self.doctrine_engine = DoctrineEngine()
+        # Shared doctrine engine (choose between statistical and neural)
+        if use_neural_doctrines:
+            from holographic.neural_doctrine_engine import NeuralDoctrineEngine
+            # Use simplified obs_dim for context features
+            self.doctrine_engine = NeuralDoctrineEngine(obs_dim=64)
+        else:
+            self.doctrine_engine = DoctrineEngine()
 
         # Communication buffer
         self.message_buffer: List[Dict[str, Any]] = []
@@ -676,6 +722,23 @@ class CognitiveQREATrainer:
 
         return applicable
 
+    def _train_embeddings_periodically(self, epoch: int):
+        """Train learned embeddings periodically (Phase 3 upgrade)"""
+        if not self.use_learned_embeddings:
+            return
+
+        # Train every 10 epochs
+        if epoch % 10 != 0:
+            return
+
+        for agent_id, agent in self.cognitive_agents.items():
+            if hasattr(agent.episodic_memory, 'train_embeddings'):
+                loss = agent.episodic_memory.train_embeddings(
+                    batch_size=128, num_steps=50
+                )
+                if loss > 0:
+                    print(f"  [Agent {agent_id}] Embedding training loss: {loss:.4f}")
+
     def train(self, epochs: Optional[int] = None):
         """
         Train with cognitive enhancements.
@@ -692,6 +755,8 @@ class CognitiveQREATrainer:
         print(f"Robots: {self.num_robots}")
         print(f"Doctrines: {'enabled' if self.enable_doctrines else 'disabled'}")
         print(f"Communication: {'enabled' if self.enable_communication else 'disabled'}")
+        print(f"Learned embeddings: {'enabled' if self.use_learned_embeddings else 'disabled'}")
+        print(f"Neural doctrines: {'enabled' if self.use_neural_doctrines else 'disabled'}")
         print("=" * 70)
 
         # Hook into base trainer's rollout
@@ -790,6 +855,12 @@ if __name__ == "__main__":
     parser.add_argument('--quick_test', action='store_true',
                         help='Quick test with 5 epochs')
 
+    # Phase 3/4 upgrades (holographic module)
+    parser.add_argument('--learned_embeddings', action='store_true',
+                        help='Phase 3: Use contrastive learned memory embeddings')
+    parser.add_argument('--neural_doctrines', action='store_true',
+                        help='Phase 4: Use neural pattern recognition for doctrines')
+
     args = parser.parse_args()
 
     if args.quick_test:
@@ -799,7 +870,9 @@ if __name__ == "__main__":
         config_path=args.config,
         encoder_type=args.encoder,
         enable_doctrines=not args.no_doctrines,
-        enable_communication=not args.no_communication
+        enable_communication=not args.no_communication,
+        use_learned_embeddings=args.learned_embeddings,
+        use_neural_doctrines=args.neural_doctrines
     )
 
     results = trainer.train(epochs=args.epochs)
