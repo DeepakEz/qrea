@@ -131,10 +131,12 @@ class UPRTField(nn.Module):
         grid_x = torch.clamp(grid_x, 0, self.grid_resolution[0] - 1)
         grid_y = torch.clamp(grid_y, 0, self.grid_resolution[1] - 1)
         
-        # Update activity field (spatial activity accumulator)
-        for i in range(robot_positions.shape[0]):
-            x, y = grid_x[i], grid_y[i]
-            self.activity_field[x, y] += robot_activities[i, :16] * dt
+        # Update activity field (spatial activity accumulator) - vectorized
+        flat_idx = grid_x * self.grid_resolution[1] + grid_y  # (N,)
+        field_flat = self.activity_field.view(-1, self.activity_field.shape[-1])  # (H*W, 16)
+        activity_contrib = robot_activities[:, :16] * dt  # (N, 16)
+        field_flat.scatter_add_(0, flat_idx.unsqueeze(-1).expand(-1, 16), activity_contrib)
+        self.activity_field = field_flat.view(*self.activity_field.shape)
         
         # Diffusion
         self.activity_field = self._apply_diffusion(
@@ -221,10 +223,16 @@ class UPRTField(nn.Module):
             gx = torch.clamp(gx, 0, self.grid_resolution[0] - 1)
             gy = torch.clamp(gy, 0, self.grid_resolution[1] - 1)
 
-            # Scatter add resonances to field (vectorized)
-            # Use index_add_ for accumulation at grid positions
-            for idx in range(len(gx)):
-                self.interaction_field[gx[idx], gy[idx]] += resonances[idx] * dt
+            # Scatter add resonances to field (truly vectorized)
+            # Convert 2D grid indices to 1D for scatter_add_
+            flat_idx = gx * self.grid_resolution[1] + gy  # (num_pairs,)
+            # Reshape field for scatter, then reshape back
+            field_flat = self.interaction_field.view(-1, self.interaction_field.shape[-1])  # (H*W, C)
+            # Expand resonances to match field channels
+            resonance_contrib = (resonances * dt).unsqueeze(-1).expand(-1, field_flat.shape[-1])  # (num_pairs, C)
+            # Scatter add
+            field_flat.scatter_add_(0, flat_idx.unsqueeze(-1).expand(-1, field_flat.shape[-1]), resonance_contrib)
+            self.interaction_field = field_flat.view(*self.interaction_field.shape)
 
         # Diffuse and decay
         self.interaction_field = self._apply_diffusion(
@@ -235,18 +243,23 @@ class UPRTField(nn.Module):
     def _update_memory_field(self, positions: torch.Tensor,
                              activities: torch.Tensor, dt: float):
         """Update memory field (long-term activity accumulation with slow decay)"""
-        # Memory field accumulates activity patterns over time
+        # Memory field accumulates activity patterns over time (vectorized)
         world_size = self.world_size.to(positions.device)
-        for i in range(positions.shape[0]):
-            gx = int(positions[i, 0] / world_size[0].item() * self.grid_resolution[0])
-            gy = int(positions[i, 1] / world_size[1].item() * self.grid_resolution[1])
+        N = positions.shape[0]
 
-            gx = np.clip(gx, 0, self.grid_resolution[0] - 1)
-            gy = np.clip(gy, 0, self.grid_resolution[1] - 1)
-            
-            # Accumulate pattern
-            self.memory_field[gx, gy] += activities[i, :32] * dt * 0.1
-        
+        # Compute grid coordinates (vectorized)
+        gx = (positions[:, 0] / world_size[0] * self.grid_resolution[0]).long()
+        gy = (positions[:, 1] / world_size[1] * self.grid_resolution[1]).long()
+        gx = torch.clamp(gx, 0, self.grid_resolution[0] - 1)
+        gy = torch.clamp(gy, 0, self.grid_resolution[1] - 1)
+
+        # Scatter add activities to field
+        flat_idx = gx * self.grid_resolution[1] + gy  # (N,)
+        field_flat = self.memory_field.view(-1, self.memory_field.shape[-1])  # (H*W, 32)
+        activity_contrib = activities[:, :32] * dt * 0.1  # (N, 32)
+        field_flat.scatter_add_(0, flat_idx.unsqueeze(-1).expand(-1, 32), activity_contrib)
+        self.memory_field = field_flat.view(*self.memory_field.shape)
+
         # Slower decay for long-term memory
         self.memory_field *= (1 - self.decay_rate * 0.1 * dt)
     
