@@ -398,15 +398,19 @@ class WarehouseEnv(gym.Env):
                 if pkg and not pkg.is_delivered:
                     # Check if at destination
                     dist = np.linalg.norm(robot.position - pkg.destination)
-                    if dist < 1.5:  # Within delivery range
-                        pkg.is_delivered = True  # CRITICAL: Mark package as delivered!
+                    # Track minimum delivery distance for diagnostics
+                    if not hasattr(self, '_min_delivery_dist'):
+                        self._min_delivery_dist = float('inf')
+                    self._min_delivery_dist = min(self._min_delivery_dist, dist)
+                    if dist < 5.0:  # Within delivery range (widened from 1.5m for early training)
+                        # Setting delivery_time marks package as delivered (is_delivered property)
                         pkg.delivery_time = self.current_step * self.dt
                         self._just_delivered[robot.id] = pkg.reward  # Track for reward
                         robot.carrying_package = None
                         robot.packages_delivered += 1
                         self.stats['packages_delivered'] += 1
                         self.stats['total_waiting_time'] += pkg.waiting_time
-                        # Debug: Log successful delivery
+                        # Debug: Log successful delivery (uncomment for diagnostics)
                         # print(f"  [DELIVERY] Robot {robot.id} delivered pkg {pkg.id} (reward={pkg.reward})")
     
     def _try_pickup_or_deliver(self, robot: Robot):
@@ -733,17 +737,19 @@ class WarehouseEnv(gym.Env):
                         progress_delta = prev_dist - dist_to_dest  # Positive if closer
                         self._prev_dist_to_dest[robot.id] = dist_to_dest
 
-                        # Scale: ~5.0 reward per meter moved toward destination
-                        # Max speed 2.0 m/s * dt 0.1 = 0.2m/step = 1.0 reward/step at max delivery speed
-                        progress_reward = 5.0 * progress_delta
+                        # Scale: ~15.0 reward per meter moved toward destination
+                        # Max speed 2.0 m/s * dt 0.1 = 0.2m/step = 3.0 reward/step at max delivery speed
+                        # Strong enough signal for agents to learn goal-directed movement
+                        progress_reward = 15.0 * progress_delta
                         reward += progress_reward  # Can be negative if moving away!
 
                         # PRE-DELIVERY REWARD: Teaches agent to slow down near delivery
                         # Delivery requires being within 1.5m of destination
-                        if dist_to_dest < 5.0:
+                        # Widen to 10m so agent starts getting guidance earlier in 40m journey
+                        if dist_to_dest < 10.0:
                             speed_factor = max(0, 1.0 - robot.speed)  # Reward slowing down
-                            close_factor = 1.0 - dist_to_dest / 5.0
-                            pre_delivery_reward = 20.0 * speed_factor * close_factor
+                            close_factor = 1.0 - dist_to_dest / 10.0
+                            pre_delivery_reward = 30.0 * speed_factor * close_factor
                             reward += pre_delivery_reward
                 else:
                     # Clear prev_dist when not carrying
