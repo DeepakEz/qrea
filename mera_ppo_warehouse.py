@@ -856,11 +856,15 @@ class MERAWarehousePPO:
                 self.coordination_history.append(asdict(metrics))
 
                 # Verbose episode logging for diagnostics
+                min_del_dist = getattr(self.env, '_min_delivery_dist', float('inf'))
                 print(f"  [Episode {self.episode_count}] "
                       f"Pickups: {env_stats.get('packages_picked_up', 0)}, "
                       f"Delivered: {env_stats['packages_delivered']}, "
                       f"Collisions: {env_stats['collisions']}, "
-                      f"Steps: {episode_steps}")
+                      f"Steps: {episode_steps}, "
+                      f"MinDelDist: {min_del_dist:.1f}m")
+                # Reset min delivery distance for next episode
+                self.env._min_delivery_dist = float('inf')
 
                 if episode_phi_q:
                     avg_phi_q = np.mean(episode_phi_q)
