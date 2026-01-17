@@ -231,11 +231,165 @@ class CoordinationMetrics:
 # Neural Network Components
 # =============================================================================
 
+def compute_von_neumann_entropy(psi: torch.Tensor, partition_idx: int) -> torch.Tensor:
+    """
+    Compute Von Neumann entanglement entropy for a bipartition.
+
+    This is the REAL physics metric used in tensor network literature.
+
+    Algorithm:
+    1. Reshape state as matrix ψ_{a,b}
+    2. Compute reduced density matrix ρ_A = ψ @ ψ†
+    3. Compute S(ρ_A) = -Tr(ρ_A log ρ_A)
+
+    References:
+    - Vidal et al., Phys. Rev. Lett. 90, 227902 (2003)
+    - Calabrese & Cardy, J. Stat. Mech. P06002 (2004)
+    """
+    batch_size = psi.shape[0]
+    total_dim = psi.shape[1]
+
+    d_A = partition_idx
+    d_B = total_dim // d_A if d_A > 0 else total_dim
+
+    # Ensure dimensions work
+    if d_A * d_B != total_dim:
+        new_total = d_A * d_B
+        if new_total > total_dim:
+            psi = F.pad(psi, (0, new_total - total_dim))
+        else:
+            psi = psi[:, :new_total]
+
+    psi_matrix = psi.reshape(batch_size, d_A, d_B)
+    rho_A = torch.bmm(psi_matrix, psi_matrix.transpose(1, 2))
+
+    # Normalize
+    trace = torch.diagonal(rho_A, dim1=1, dim2=2).sum(dim=1, keepdim=True).unsqueeze(-1)
+    rho_A = rho_A / (trace + 1e-10)
+
+    try:
+        eigenvalues = torch.linalg.eigvalsh(rho_A)
+        eigenvalues = torch.clamp(eigenvalues, min=1e-10)
+        S_vN = -torch.sum(eigenvalues * torch.log(eigenvalues), dim=-1)
+    except RuntimeError:
+        S_vN = torch.zeros(batch_size, device=psi.device)
+
+    return S_vN
+
+
+def compute_geometric_phi(X: torch.Tensor, partition_idx: int) -> torch.Tensor:
+    """
+    Compute Geometric Integrated Information (Φ_G).
+
+    Based on Barrett & Seth (2011) "Practical Measures of Integrated Information".
+
+    Φ_G = 0.5 * log(det(Σ) / (det(Σ_A) * det(Σ_B)))
+
+    This is the Gaussian approximation to integrated information.
+
+    References:
+    - Barrett & Seth, PLoS Comput Biol 7(1): e1001052 (2011)
+    - Oizumi et al., PLoS Comput Biol 12(3): e1004654 (2016)
+    """
+    batch_size, dim = X.shape
+    if partition_idx <= 0 or partition_idx >= dim:
+        return torch.zeros(batch_size, device=X.device)
+
+    X_A = X[:, :partition_idx]
+    X_B = X[:, partition_idx:]
+
+    X_centered = X - X.mean(dim=0, keepdim=True)
+    X_A_centered = X_A - X_A.mean(dim=0, keepdim=True)
+    X_B_centered = X_B - X_B.mean(dim=0, keepdim=True)
+
+    reg = 1e-6 * torch.eye(dim, device=X.device)
+    reg_A = 1e-6 * torch.eye(partition_idx, device=X.device)
+    reg_B = 1e-6 * torch.eye(dim - partition_idx, device=X.device)
+
+    Sigma = X_centered.T @ X_centered / batch_size + reg
+    Sigma_A = X_A_centered.T @ X_A_centered / batch_size + reg_A
+    Sigma_B = X_B_centered.T @ X_B_centered / batch_size + reg_B
+
+    try:
+        log_det_Sigma = torch.linalg.slogdet(Sigma)[1]
+        log_det_Sigma_A = torch.linalg.slogdet(Sigma_A)[1]
+        log_det_Sigma_B = torch.linalg.slogdet(Sigma_B)[1]
+
+        phi_g = 0.5 * (log_det_Sigma_A + log_det_Sigma_B - log_det_Sigma)
+        phi_g = torch.clamp(phi_g, min=0.0)
+        return phi_g.expand(batch_size)
+    except RuntimeError:
+        return torch.zeros(batch_size, device=X.device)
+
+
+def compute_representation_coherence(representations: torch.Tensor) -> torch.Tensor:
+    """
+    Compute RESEARCH-GRADE integration metric across all encoder types.
+
+    Combines two rigorous measures:
+    1. Von Neumann Entanglement Entropy (S_vN) - physics metric
+    2. Geometric Integrated Information (Φ_G) - IIT approximation
+
+    This ensures fair, scientifically meaningful comparison across encoders.
+
+    References:
+    - Vidal et al., Phys. Rev. Lett. 90, 227902 (2003) - S_vN
+    - Barrett & Seth, PLoS Comput Biol 7(1): e1001052 (2011) - Φ_G
+    - Oizumi et al., PLoS Comput Biol 12(3): e1004654 (2016) - IIT
+
+    Args:
+        representations: (batch, dim) or (batch, seq_len, dim) tensor
+
+    Returns:
+        coherence: (batch,) tensor - combined S_vN and Φ_G
+    """
+    with torch.no_grad():
+        # Flatten 3D to 2D
+        if representations.dim() == 3:
+            B, T, D = representations.shape
+            X = representations.reshape(B, T * D)
+        else:
+            X = representations
+
+        B, dim = X.shape
+
+        # Normalize to unit norm (pure state condition for S_vN)
+        psi = F.normalize(X, dim=-1)
+
+        # Compute metrics at multiple partitions
+        S_vN_values = []
+        phi_g_values = []
+
+        for frac in [0.25, 0.33, 0.5]:
+            partition_idx = max(1, min(dim - 1, int(dim * frac)))
+
+            S_vN = compute_von_neumann_entropy(psi, partition_idx)
+            phi_g = compute_geometric_phi(X, partition_idx)
+
+            S_vN_values.append(S_vN)
+            phi_g_values.append(phi_g)
+
+        # Average across partitions
+        S_vN_avg = torch.stack(S_vN_values, dim=-1).mean(dim=-1)
+        phi_g_avg = torch.stack(phi_g_values, dim=-1).mean(dim=-1)
+
+        # Normalize to [0, 1] range
+        max_entropy = math.log(dim // 2 + 1)
+        S_vN_normalized = S_vN_avg / (max_entropy + 1e-8)
+        phi_g_normalized = torch.clamp(phi_g_avg, 0, 10) / 10.0
+
+        # Combined metric
+        coherence = (S_vN_normalized + phi_g_normalized) / 2.0
+        coherence = torch.clamp(coherence, 0.0, 1.0)
+
+        return coherence
+
+
 class MLPEncoder(nn.Module):
     """Baseline MLP encoder for comparison.
 
-    NOTE: MLP flattens temporal history, losing structure. For fair comparison,
-    we compute a representation coherence metric based on output activation patterns.
+    NOTE: MLP flattens temporal history, losing structure.
+    Uses unified coherence metric for fair comparison with other encoders.
     """
 
     def __init__(self, input_dim: int, output_dim: int, hidden_dims: List[int] = [256, 256]):
@@ -254,17 +408,10 @@ class MLPEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
         latent = self.net(x)
 
-        # Compute representation coherence (analogous to phi_q)
-        # For MLP, measure how "structured" the output is via activation sparsity
-        with torch.no_grad():
-            # Normalized activation magnitude variance (higher = more structured)
-            latent_norm = F.normalize(latent, dim=-1)
-            # Variance of squared activations (Gini-like sparsity)
-            coherence = latent_norm.pow(2).var(dim=-1)  # (B,)
-            # Scale to reasonable range [0, 1]
-            coherence = torch.clamp(coherence * 10, 0, 1)
+        # FIX: Use unified coherence metric for fair comparison across encoders
+        coherence = compute_representation_coherence(latent)
 
-        return latent, {'phi_q': coherence.detach()}
+        return latent, {'phi_q': coherence}
 
 
 class GRUEncoder(nn.Module):
@@ -310,19 +457,11 @@ class GRUEncoder(nn.Module):
         latent = h_n[-1]  # (B, H)
         latent = self.output_projection(latent)
 
-        # Compute temporal coherence metric (analogous to phi_q for fair comparison)
-        # Measures correlation between hidden states across time
-        with torch.no_grad():
-            # Compute correlation between first and last half of sequence
-            T = gru_out.shape[1]
-            first_half = gru_out[:, :T//2, :].mean(dim=1)  # (B, H)
-            second_half = gru_out[:, T//2:, :].mean(dim=1)  # (B, H)
-            # Cosine similarity as coherence measure
-            coherence = F.cosine_similarity(first_half, second_half, dim=-1)  # (B,)
-            # Map to [0, 1] range
-            temporal_coherence = (coherence + 1) / 2
+        # FIX: Use unified coherence metric for fair comparison across encoders
+        # Pass gru_out (B, T, H) for temporal coherence computation
+        coherence = compute_representation_coherence(gru_out)
 
-        return latent, {'phi_q': temporal_coherence.detach()}
+        return latent, {'phi_q': coherence}
 
 
 class TransformerEncoder(nn.Module):
@@ -385,20 +524,11 @@ class TransformerEncoder(nn.Module):
         latent = x.mean(dim=1)  # (B, d_model)
         latent = self.output_projection(latent)
 
-        # Compute temporal coherence metric (analogous to phi_q for fair comparison)
-        # Measures how structured/correlated the transformer output is across time
-        with torch.no_grad():
-            # Compute pairwise cosine similarity between time steps
-            x_norm = F.normalize(x, dim=-1)  # (B, T, d_model)
-            # Self-similarity matrix
-            sim_matrix = torch.bmm(x_norm, x_norm.transpose(1, 2))  # (B, T, T)
-            # Average off-diagonal similarity (temporal coherence)
-            mask = ~torch.eye(seq_len, dtype=torch.bool, device=x.device)
-            temporal_coherence = sim_matrix[:, mask].mean(dim=-1)  # (B,)
-            # Already in [-1, 1], map to [0, 1]
-            temporal_coherence = (temporal_coherence + 1) / 2
+        # FIX: Use unified coherence metric for fair comparison across encoders
+        # Pass transformer output (B, T, d_model) for temporal coherence computation
+        coherence = compute_representation_coherence(x)
 
-        return latent, {'phi_q': temporal_coherence.detach()}
+        return latent, {'phi_q': coherence}
 
 
 class MERAEncoder(nn.Module):
@@ -968,7 +1098,14 @@ class MERAWarehousePPO:
         return robot_transitions, {'env_stats': epoch_env_stats, 'epoch_reward': epoch_total_reward}
 
     def compute_returns(self, transitions: List[Transition]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute GAE returns and advantages"""
+        """Compute GAE returns and advantages.
+
+        FIX: Proper bootstrap value handling for multi-episode rollouts:
+        - If last transition is terminal (done=True): next_value = 0
+        - If last transition is NOT terminal (truncated): next_value = V(s_last)
+
+        This ensures we don't treat truncated rollouts as having zero future value.
+        """
         rewards = [t.reward for t in transitions]
         values = [t.value for t in transitions]
         dones = [t.done for t in transitions]
@@ -977,7 +1114,14 @@ class MERAWarehousePPO:
         gae = 0.0
 
         for t in reversed(range(len(transitions))):
-            next_value = 0.0 if t == len(transitions) - 1 else values[t + 1]
+            if t == len(transitions) - 1:
+                # FIX: For last transition, check if it was terminal or truncated
+                # If truncated (not done), bootstrap from last value estimate
+                # If terminal (done), next_value = 0
+                next_value = 0.0 if dones[t] else values[t]
+            else:
+                next_value = values[t + 1]
+
             delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - values[t]
             gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
             returns.insert(0, gae + values[t])
@@ -985,12 +1129,19 @@ class MERAWarehousePPO:
 
         returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
         advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
+
+        # FIX: Normalize both advantages AND returns for stable value learning
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
         return returns, advantages
 
     def update(self, robot_transitions: Dict[int, List[Transition]]):
-        """PPO update step"""
+        """PPO update step with value clipping.
+
+        FIX: Added PPO value clipping to prevent large value function updates.
+        This is standard in PPO implementations (OpenAI, CleanRL, etc.)
+        """
         all_transitions = []
         for i in range(self.num_robots):
             all_transitions.extend(robot_transitions[i])
@@ -1004,6 +1155,9 @@ class MERAWarehousePPO:
                               dtype=torch.float32, device=self.device)
         old_log_probs = torch.tensor([t.log_prob for t in all_transitions],
                                      dtype=torch.float32, device=self.device)
+        # FIX: Store old values for value clipping
+        old_values = torch.tensor([t.value for t in all_transitions],
+                                  dtype=torch.float32, device=self.device)
 
         # Extract robot positions for mera_uprt encoder
         if self.encoder_type == 'mera_uprt' and all_transitions[0].robot_position is not None:
@@ -1044,6 +1198,7 @@ class MERAWarehousePPO:
                 batch_obs = obs[batch_idx]
                 batch_actions = actions[batch_idx]
                 batch_old_log_probs = old_log_probs[batch_idx]
+                batch_old_values = old_values[batch_idx]  # FIX: Get old values
                 batch_returns = returns[batch_idx]
                 batch_advantages = advantages[batch_idx]
                 batch_positions = robot_positions[batch_idx] if robot_positions is not None else None
@@ -1052,13 +1207,23 @@ class MERAWarehousePPO:
                     batch_obs, batch_actions, batch_positions
                 )
 
+                # Policy loss with clipping
                 ratio = torch.exp(log_probs - batch_old_log_probs)
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon,
                                     1 + self.clip_epsilon) * batch_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                value_loss = F.mse_loss(values, batch_returns)
+                # FIX: Value loss with clipping (standard PPO technique)
+                # Prevents large value function updates that can destabilize training
+                values_clipped = batch_old_values + torch.clamp(
+                    values - batch_old_values,
+                    -self.clip_epsilon, self.clip_epsilon
+                )
+                value_loss_unclipped = (values - batch_returns) ** 2
+                value_loss_clipped = (values_clipped - batch_returns) ** 2
+                value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+
                 entropy_loss = -entropy.mean()
 
                 # MERA constraint losses (isometry, scale consistency)

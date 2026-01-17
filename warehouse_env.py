@@ -309,28 +309,34 @@ class WarehouseEnv(gym.Env):
     def _apply_action(self, robot: Robot, action: np.ndarray):
         """Apply action to robot"""
         linear_vel, angular_vel, gripper = action
-        
+
         # Clip actions
         linear_vel = np.clip(linear_vel, -self.max_speed, self.max_speed)
         angular_vel = np.clip(angular_vel, -self.max_angular_vel, self.max_angular_vel)
-        
+
         # Update velocity (with acceleration limits)
         target_vel = np.array([
             linear_vel * np.cos(robot.orientation),
             linear_vel * np.sin(robot.orientation)
         ])
-        
+
         vel_diff = target_vel - robot.velocity
         max_vel_change = self.max_acceleration * self.dt
-        
+
         if np.linalg.norm(vel_diff) > max_vel_change:
             vel_diff = vel_diff / np.linalg.norm(vel_diff) * max_vel_change
-        
+
         robot.velocity = robot.velocity + vel_diff
-        
-        # Update angular velocity
-        robot.angular_velocity = angular_vel
-        
+
+        # FIX: Update angular velocity with acceleration limiting
+        # Previously: robot.angular_velocity = angular_vel (instantaneous change)
+        # Now: limit angular acceleration to prevent unrealistic instant rotation
+        max_angular_accel = 3.0  # rad/s² - reasonable for wheeled robot
+        angular_diff = angular_vel - robot.angular_velocity
+        max_angular_change = max_angular_accel * self.dt
+        angular_diff = np.clip(angular_diff, -max_angular_change, max_angular_change)
+        robot.angular_velocity = robot.angular_velocity + angular_diff
+
         # Handle gripper - agent must LEARN to use gripper action
         # No auto-pickup: research validity requires natural learning
         should_try_pickup = gripper > 0.5
@@ -504,23 +510,49 @@ class WarehouseEnv(gym.Env):
             self.next_package_id += 1
     
     def _check_collisions(self):
-        """Check and handle robot-robot collisions"""
+        """Check and handle robot-robot collisions with proper physics.
+
+        FIX: Added elastic collision response with momentum conservation.
+        Previously only pushed robots apart without velocity exchange.
+        """
         for i, robot1 in enumerate(self.robots):
             for robot2 in self.robots[i+1:]:
                 dist = np.linalg.norm(robot1.position - robot2.position)
                 min_dist = 2 * self.robot_radius
-                
+
                 if dist < min_dist:
                     # Collision detected
                     robot1.collision_count += 1
                     robot2.collision_count += 1
                     self.stats['collisions'] += 1
-                    
-                    # Push apart
+
+                    # Collision normal (from robot1 to robot2)
+                    normal = (robot2.position - robot1.position) / (dist + 1e-6)
+
+                    # Push apart (position correction)
                     overlap = min_dist - dist
-                    direction = (robot2.position - robot1.position) / (dist + 1e-6)
-                    robot1.position -= direction * overlap * 0.5
-                    robot2.position += direction * overlap * 0.5
+                    robot1.position -= normal * overlap * 0.5
+                    robot2.position += normal * overlap * 0.5
+
+                    # FIX: Elastic collision response (momentum + energy conservation)
+                    # For equal mass robots, this simplifies to velocity component exchange
+                    # along collision normal
+                    v1_normal = np.dot(robot1.velocity, normal)
+                    v2_normal = np.dot(robot2.velocity, normal)
+
+                    # Only respond if robots are approaching (avoid double-response)
+                    relative_vel = v1_normal - v2_normal
+                    if relative_vel > 0:
+                        # Coefficient of restitution (1.0 = perfectly elastic, 0.5 = some energy loss)
+                        restitution = 0.7
+
+                        # For equal masses: exchange velocity components along normal
+                        # v1_new = v1 - (1+e)/2 * (v1-v2)·n * n
+                        # v2_new = v2 + (1+e)/2 * (v1-v2)·n * n
+                        impulse = (1 + restitution) * relative_vel * 0.5
+
+                        robot1.velocity -= impulse * normal
+                        robot2.velocity += impulse * normal
     
     def _get_observation(self, robot: Robot) -> np.ndarray:
         """Get observation for a robot"""
@@ -751,8 +783,10 @@ class WarehouseEnv(gym.Env):
                             self._progress_history[robot.id].pop(0)
 
                         # Scale: ~15.0 reward per meter moved toward destination
-                        progress_reward = 15.0 * progress_delta
-                        reward += progress_reward  # Can be negative if moving away!
+                        # FIX: Bound negative progress to prevent catastrophic penalties
+                        # Allows mild punishment for wrong direction but not runaway negatives
+                        progress_reward = np.clip(15.0 * progress_delta, -5.0, 15.0)
+                        reward += progress_reward
 
                         # ANTI-OSCILLATION: Penalize if net progress over window is near zero
                         # This prevents agents from oscillating to harvest rewards
@@ -842,12 +876,19 @@ class WarehouseEnv(gym.Env):
     
     def get_statistics(self) -> dict:
         """Get environment statistics"""
+        # FIX: Aggregate energy stats from robots (was never done before)
+        # This makes the 'efficiency' metric actually meaningful
+        total_energy = sum(robot.energy_consumed for robot in self.robots)
+        total_distance = sum(robot.distance_traveled for robot in self.robots)
+
         return {
             **self.stats,
+            'total_energy': total_energy,  # FIX: Override with actual aggregated value
+            'total_distance': total_distance,  # FIX: Add actual distance
             'throughput': self.stats['packages_delivered'] / (self.current_step * self.dt + 1e-6) * 3600,
             'avg_waiting_time': self.stats['total_waiting_time'] / (self.stats['packages_delivered'] + 1e-6),
-            'avg_distance': self.stats['total_distance'] / (self.stats['packages_delivered'] + 1e-6),
-            'efficiency': self.stats['packages_delivered'] / (self.stats['total_energy'] + 1e-6)
+            'avg_distance': total_distance / (self.stats['packages_delivered'] + 1e-6),
+            'efficiency': self.stats['packages_delivered'] / (total_energy + 1e-6)
         }
 
     def get_global_state_snapshot(self) -> dict:
