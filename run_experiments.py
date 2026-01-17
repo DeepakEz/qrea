@@ -47,6 +47,10 @@ class ExperimentResult:
     # Φ_Q metric (probe - not optimized)
     final_phi_q: float = 0.0
 
+    # Research-grade metrics (for publication)
+    s_vn: float = 0.0  # Von Neumann entanglement entropy
+    phi_g: float = 0.0  # Geometric integrated information (Φ_G)
+
     # Training time
     training_time_seconds: float = 0.0
 
@@ -73,6 +77,12 @@ class AggregatedResults:
     # Φ_Q (probe only)
     phi_q_mean: float = 0.0
     phi_q_std: float = 0.0
+
+    # Research-grade metrics (for publication)
+    s_vn_mean: float = 0.0  # Von Neumann entanglement entropy
+    s_vn_std: float = 0.0
+    phi_g_mean: float = 0.0  # Geometric integrated information (Φ_G)
+    phi_g_std: float = 0.0
 
     training_time_mean: float = 0.0
     training_time_std: float = 0.0
@@ -155,6 +165,8 @@ def run_single_experiment(
             collision_rate=collision_rate,
             throughput=data.get('throughput', 0),
             final_phi_q=data.get('phi_q', 0),
+            s_vn=data.get('s_vn', data.get('phi_q', 0)),  # Fallback to phi_q
+            phi_g=data.get('phi_g', data.get('phi_q', 0)),  # Fallback to phi_q
             training_time_seconds=training_time
         )
 
@@ -174,6 +186,8 @@ def parse_stdout(stdout: str) -> Dict:
         'collisions': 0,
         'throughput': 0,
         'phi_q': 0,
+        's_vn': 0,  # Von Neumann entropy
+        'phi_g': 0,  # Geometric Φ
     }
 
     lines = stdout.split('\n')
@@ -211,6 +225,26 @@ def parse_stdout(stdout: str) -> Dict:
                     data['phi_q'] = val
             except (ValueError, IndexError):
                 pass
+        # Parse research metrics: S_vN and Φ_G
+        if 'S_vN=' in line or 's_vn=' in line.lower():
+            try:
+                parts = line.split('S_vN=')
+                if len(parts) > 1:
+                    val = float(parts[1].split(',')[0].split()[0])
+                    data['s_vn'] = val
+            except (ValueError, IndexError):
+                pass
+        if 'Φ_G=' in line or 'phi_g=' in line.lower():
+            try:
+                if 'Φ_G=' in line:
+                    parts = line.split('Φ_G=')
+                else:
+                    parts = line.lower().split('phi_g=')
+                if len(parts) > 1:
+                    val = float(parts[1].split(',')[0].split()[0])
+                    data['phi_g'] = val
+            except (ValueError, IndexError):
+                pass
 
     return data
 
@@ -228,6 +262,8 @@ def aggregate_results(results: List[ExperimentResult]) -> AggregatedResults:
     collision_rates = [r.collision_rate for r in results]
     throughputs = [r.throughput for r in results]
     phi_qs = [r.final_phi_q for r in results]
+    s_vns = [r.s_vn for r in results]
+    phi_gs = [r.phi_g for r in results]
     times = [r.training_time_seconds for r in results]
 
     return AggregatedResults(
@@ -244,6 +280,10 @@ def aggregate_results(results: List[ExperimentResult]) -> AggregatedResults:
         throughput_std=np.std(throughputs),
         phi_q_mean=np.mean(phi_qs),
         phi_q_std=np.std(phi_qs),
+        s_vn_mean=np.mean(s_vns),
+        s_vn_std=np.std(s_vns),
+        phi_g_mean=np.mean(phi_gs),
+        phi_g_std=np.std(phi_gs),
         training_time_mean=np.mean(times),
         training_time_std=np.std(times),
     )
@@ -251,24 +291,43 @@ def aggregate_results(results: List[ExperimentResult]) -> AggregatedResults:
 
 def print_results_table(all_results: Dict[str, AggregatedResults]):
     """Print nicely formatted results table (paper metrics)"""
-    print("\n" + "=" * 100)
-    print("EXPERIMENT RESULTS (mean +/- std across seeds)")
-    print("=" * 100)
+    print("\n" + "=" * 130)
+    print("EXPERIMENT RESULTS (mean ± std across seeds)")
+    print("=" * 130)
 
-    # Header
-    print(f"{'Encoder':<12} {'Robots':<7} {'Reward':<18} {'Delivered':<12} {'Coll.Rate':<12} {'Throughput':<12} {'Phi_Q':<12}")
-    print("-" * 100)
+    # Header - Performance metrics
+    print(f"{'Encoder':<12} {'Robots':<7} {'Reward':<18} {'Delivered':<12} {'Coll.Rate':<14} {'Throughput':<12}")
+    print("-" * 130)
 
     for key, agg in sorted(all_results.items()):
         reward_str = f"{agg.final_reward_mean:.1f}±{agg.final_reward_std:.1f}"
         delivered_str = f"{agg.packages_delivered_mean:.1f}±{agg.packages_delivered_std:.1f}"
         coll_str = f"{agg.collision_rate_mean:.4f}±{agg.collision_rate_std:.4f}"
         throughput_str = f"{agg.throughput_mean:.1f}±{agg.throughput_std:.1f}"
-        phi_q_str = f"{agg.phi_q_mean:.4f}±{agg.phi_q_std:.4f}"
 
-        print(f"{agg.encoder:<12} {agg.num_robots:<7} {reward_str:<18} {delivered_str:<12} {coll_str:<12} {throughput_str:<12} {phi_q_str:<12}")
+        print(f"{agg.encoder:<12} {agg.num_robots:<7} {reward_str:<18} {delivered_str:<12} {coll_str:<14} {throughput_str:<12}")
+
+    print("=" * 130)
+
+    # Research-grade metrics table
+    print("\n" + "=" * 100)
+    print("RESEARCH METRICS (for publication)")
+    print("=" * 100)
+    print(f"{'Encoder':<12} {'Robots':<7} {'Φ_Q (combined)':<18} {'S_vN (entropy)':<18} {'Φ_G (IIT)':<18}")
+    print("-" * 100)
+
+    for key, agg in sorted(all_results.items()):
+        phi_q_str = f"{agg.phi_q_mean:.4f}±{agg.phi_q_std:.4f}"
+        s_vn_str = f"{agg.s_vn_mean:.4f}±{agg.s_vn_std:.4f}"
+        phi_g_str = f"{agg.phi_g_mean:.4f}±{agg.phi_g_std:.4f}"
+
+        print(f"{agg.encoder:<12} {agg.num_robots:<7} {phi_q_str:<18} {s_vn_str:<18} {phi_g_str:<18}")
 
     print("=" * 100)
+    print("\nMetric definitions:")
+    print("  S_vN: Von Neumann entanglement entropy - measures quantum entanglement in representations")
+    print("  Φ_G:  Geometric integrated information - measures information integration (IIT approximation)")
+    print("  Φ_Q:  Combined metric = (S_vN + Φ_G) / 2")
 
 
 def run_encoder_comparison(

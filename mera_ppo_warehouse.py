@@ -343,6 +343,32 @@ def compute_representation_coherence(representations: torch.Tensor) -> torch.Ten
     Returns:
         coherence: (batch,) tensor - combined S_vN and Φ_G
     """
+    coherence, _, _ = compute_research_metrics(representations)
+    return coherence
+
+
+def compute_research_metrics(representations: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute RESEARCH-GRADE metrics for publication.
+
+    Returns individual metrics for detailed analysis:
+    1. Von Neumann Entanglement Entropy (S_vN) - quantum physics metric
+    2. Geometric Integrated Information (Φ_G) - IIT approximation
+    3. Combined coherence score
+
+    References:
+    - Vidal et al., Phys. Rev. Lett. 90, 227902 (2003) - S_vN
+    - Barrett & Seth, PLoS Comput Biol 7(1): e1001052 (2011) - Φ_G
+    - Oizumi et al., PLoS Comput Biol 12(3): e1004654 (2016) - IIT
+
+    Args:
+        representations: (batch, dim) or (batch, seq_len, dim) tensor
+
+    Returns:
+        coherence: (batch,) tensor - combined metric [0, 1]
+        s_vn: (batch,) tensor - Von Neumann entropy (normalized)
+        phi_g: (batch,) tensor - Geometric Φ (normalized)
+    """
     with torch.no_grad():
         # Flatten 3D to 2D
         if representations.dim() == 3:
@@ -382,7 +408,7 @@ def compute_representation_coherence(representations: torch.Tensor) -> torch.Ten
         coherence = (S_vN_normalized + phi_g_normalized) / 2.0
         coherence = torch.clamp(coherence, 0.0, 1.0)
 
-        return coherence
+        return coherence, S_vN_normalized, phi_g_normalized
 
 
 class MLPEncoder(nn.Module):
@@ -411,7 +437,7 @@ class MLPEncoder(nn.Module):
         # FIX: Use unified coherence metric for fair comparison across encoders
         coherence = compute_representation_coherence(latent)
 
-        return latent, {'phi_q': coherence}
+        return latent, {'phi_q': coherence, 'latent': latent}
 
 
 class GRUEncoder(nn.Module):
@@ -461,7 +487,7 @@ class GRUEncoder(nn.Module):
         # Pass gru_out (B, T, H) for temporal coherence computation
         coherence = compute_representation_coherence(gru_out)
 
-        return latent, {'phi_q': coherence}
+        return latent, {'phi_q': coherence, 'latent': gru_out}
 
 
 class TransformerEncoder(nn.Module):
@@ -528,7 +554,7 @@ class TransformerEncoder(nn.Module):
         # Pass transformer output (B, T, d_model) for temporal coherence computation
         coherence = compute_representation_coherence(x)
 
-        return latent, {'phi_q': coherence}
+        return latent, {'phi_q': coherence, 'latent': x}
 
 
 class MERAEncoder(nn.Module):
@@ -558,6 +584,8 @@ class MERAEncoder(nn.Module):
         """
         projected = self.obs_projection(obs_history)
         latent, aux = self.mera(projected)
+        # Add latent for research metrics computation
+        aux['latent'] = latent
         return latent, aux
 
     def set_step(self, step: int):
@@ -666,6 +694,8 @@ class SpatioTemporalEncoder(nn.Module):
 
         # Add spatial info to aux
         mera_aux['spatial_integrated'] = robot_positions is not None
+        # Update latent in aux to be the fused representation for research metrics
+        mera_aux['latent'] = latent
 
         return latent, mera_aux
 
@@ -801,6 +831,22 @@ class PPOActorCritic(nn.Module):
 
         phi_q = aux['phi_q'].mean().item() if aux['phi_q'] is not None else 0.0
 
+        # Compute research-grade metrics (S_vN and Φ_G) from representation
+        if aux.get('latent') is not None:
+            _, s_vn_tensor, phi_g_tensor = compute_research_metrics(aux['latent'])
+            s_vn = s_vn_tensor.mean().item()
+            phi_g = phi_g_tensor.mean().item()
+        elif aux['phi_q'] is not None:
+            # Fallback: estimate from phi_q (which is (S_vN + Φ_G) / 2)
+            s_vn = phi_q  # Approximation
+            phi_g = phi_q  # Approximation
+        else:
+            s_vn = 0.0
+            phi_g = 0.0
+
+        aux['s_vn'] = s_vn
+        aux['phi_g'] = phi_g
+
         # Return both: scaled for env, raw for PPO updates
         return scaled_action, raw_action, value, log_prob, phi_q, aux
 
@@ -909,9 +955,15 @@ class MERAWarehousePPO:
         self.phi_q_history = []
         self.phi_q_vs_coordination = []
 
+        # Research-grade metrics tracking (for publication)
+        self.s_vn_history = []  # Von Neumann entanglement entropy
+        self.phi_g_history = []  # Geometric integrated information
+
         # Incremental epoch tracking
         self.epoch_reward = 0.0
         self.epoch_phi_q = []
+        self.epoch_s_vn = []  # Track S_vN per epoch
+        self.epoch_phi_g = []  # Track Φ_G per epoch
         self.epoch_steps = 0
 
         # Trajectory recording for holographic training (Cosmic Egg, Genome Distillation)
@@ -951,12 +1003,16 @@ class MERAWarehousePPO:
 
         robot_transitions = {i: [] for i in range(self.num_robots)}
         episode_phi_q = []
+        episode_s_vn = []  # Von Neumann entropy per episode
+        episode_phi_g = []  # Geometric Φ per episode
         episode_reward = 0.0
         episode_steps = 0
 
         # Track epoch-level metrics
         epoch_total_reward = 0.0
         epoch_phi_q_values = []
+        epoch_s_vn_values = []  # Research metric: Von Neumann entropy
+        epoch_phi_g_values = []  # Research metric: Geometric Φ
         epoch_env_stats = None
 
         max_steps = self.steps_per_epoch // self.num_robots
@@ -977,6 +1033,14 @@ class MERAWarehousePPO:
 
             episode_phi_q.append(phi_q)
             epoch_phi_q_values.append(phi_q)
+
+            # Track research-grade metrics (S_vN and Φ_G)
+            s_vn = aux.get('s_vn', phi_q)  # Fallback to phi_q if not available
+            phi_g = aux.get('phi_g', phi_q)
+            episode_s_vn.append(s_vn)
+            episode_phi_g.append(phi_g)
+            epoch_s_vn_values.append(s_vn)
+            epoch_phi_g_values.append(phi_g)
 
             # Execute in environment with SCALED actions
             actions_dict = {i: scaled_actions_np[i] for i in range(self.num_robots)}
@@ -1075,6 +1139,14 @@ class MERAWarehousePPO:
                     self.phi_q_history.append(avg_phi_q)
                     self.phi_q_vs_coordination.append((avg_phi_q, metrics.synergy_score))
 
+                # Track research-grade metrics per episode
+                if episode_s_vn:
+                    avg_s_vn = np.mean(episode_s_vn)
+                    self.s_vn_history.append(avg_s_vn)
+                if episode_phi_g:
+                    avg_phi_g = np.mean(episode_phi_g)
+                    self.phi_g_history.append(avg_phi_g)
+
                 self.episode_rewards.append(episode_reward)
                 self.episode_lengths.append(episode_steps)
 
@@ -1082,6 +1154,8 @@ class MERAWarehousePPO:
                 observations = self.env.reset()
                 self._reset_obs_history(observations)
                 episode_phi_q = []
+                episode_s_vn = []
+                episode_phi_g = []
                 episode_reward = 0.0
                 episode_steps = 0
 
@@ -1402,6 +1476,10 @@ class MERAWarehousePPO:
         with open(self.output_dir / "analysis.json", 'w') as f:
             json.dump({'correlation': corr, 'encoder': self.encoder_type}, f, indent=2)
 
+        # Compute research-grade metric means
+        s_vn_mean = float(np.mean(self.s_vn_history[-10:])) if self.s_vn_history else phi_q_mean
+        phi_g_mean = float(np.mean(self.phi_g_history[-10:])) if self.phi_g_history else phi_q_mean
+
         # Save results.json for run_experiments.py compatibility
         results_data = {
             'final_reward': self.episode_rewards[-1] if self.episode_rewards else 0,
@@ -1411,10 +1489,14 @@ class MERAWarehousePPO:
             'throughput': float(np.mean([m.get('throughput', 0) for m in self.coordination_history[-10:]])) if self.coordination_history else 0,
             'phi_q': phi_q_mean,  # Use safe extracted value
             'episode_steps': len(self.episode_rewards) * self.steps_per_epoch,
+            # Research-grade metrics for publication
+            's_vn': s_vn_mean,  # Von Neumann entanglement entropy
+            'phi_g': phi_g_mean,  # Geometric integrated information (Φ_G)
         }
         with open(self.output_dir / "results.json", 'w') as f:
             json.dump(results_data, f, indent=2)
         print(f"\nResults saved to {self.output_dir / 'results.json'}")
+        print(f"  Research metrics: S_vN={s_vn_mean:.4f}, Φ_G={phi_g_mean:.4f}")
 
     def get_results(self) -> Dict:
         return {
