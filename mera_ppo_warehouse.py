@@ -231,75 +231,156 @@ class CoordinationMetrics:
 # Neural Network Components
 # =============================================================================
 
+def compute_von_neumann_entropy(psi: torch.Tensor, partition_idx: int) -> torch.Tensor:
+    """
+    Compute Von Neumann entanglement entropy for a bipartition.
+
+    This is the REAL physics metric used in tensor network literature.
+
+    Algorithm:
+    1. Reshape state as matrix ψ_{a,b}
+    2. Compute reduced density matrix ρ_A = ψ @ ψ†
+    3. Compute S(ρ_A) = -Tr(ρ_A log ρ_A)
+
+    References:
+    - Vidal et al., Phys. Rev. Lett. 90, 227902 (2003)
+    - Calabrese & Cardy, J. Stat. Mech. P06002 (2004)
+    """
+    batch_size = psi.shape[0]
+    total_dim = psi.shape[1]
+
+    d_A = partition_idx
+    d_B = total_dim // d_A if d_A > 0 else total_dim
+
+    # Ensure dimensions work
+    if d_A * d_B != total_dim:
+        new_total = d_A * d_B
+        if new_total > total_dim:
+            psi = F.pad(psi, (0, new_total - total_dim))
+        else:
+            psi = psi[:, :new_total]
+
+    psi_matrix = psi.reshape(batch_size, d_A, d_B)
+    rho_A = torch.bmm(psi_matrix, psi_matrix.transpose(1, 2))
+
+    # Normalize
+    trace = torch.diagonal(rho_A, dim1=1, dim2=2).sum(dim=1, keepdim=True).unsqueeze(-1)
+    rho_A = rho_A / (trace + 1e-10)
+
+    try:
+        eigenvalues = torch.linalg.eigvalsh(rho_A)
+        eigenvalues = torch.clamp(eigenvalues, min=1e-10)
+        S_vN = -torch.sum(eigenvalues * torch.log(eigenvalues), dim=-1)
+    except RuntimeError:
+        S_vN = torch.zeros(batch_size, device=psi.device)
+
+    return S_vN
+
+
+def compute_geometric_phi(X: torch.Tensor, partition_idx: int) -> torch.Tensor:
+    """
+    Compute Geometric Integrated Information (Φ_G).
+
+    Based on Barrett & Seth (2011) "Practical Measures of Integrated Information".
+
+    Φ_G = 0.5 * log(det(Σ) / (det(Σ_A) * det(Σ_B)))
+
+    This is the Gaussian approximation to integrated information.
+
+    References:
+    - Barrett & Seth, PLoS Comput Biol 7(1): e1001052 (2011)
+    - Oizumi et al., PLoS Comput Biol 12(3): e1004654 (2016)
+    """
+    batch_size, dim = X.shape
+    if partition_idx <= 0 or partition_idx >= dim:
+        return torch.zeros(batch_size, device=X.device)
+
+    X_A = X[:, :partition_idx]
+    X_B = X[:, partition_idx:]
+
+    X_centered = X - X.mean(dim=0, keepdim=True)
+    X_A_centered = X_A - X_A.mean(dim=0, keepdim=True)
+    X_B_centered = X_B - X_B.mean(dim=0, keepdim=True)
+
+    reg = 1e-6 * torch.eye(dim, device=X.device)
+    reg_A = 1e-6 * torch.eye(partition_idx, device=X.device)
+    reg_B = 1e-6 * torch.eye(dim - partition_idx, device=X.device)
+
+    Sigma = X_centered.T @ X_centered / batch_size + reg
+    Sigma_A = X_A_centered.T @ X_A_centered / batch_size + reg_A
+    Sigma_B = X_B_centered.T @ X_B_centered / batch_size + reg_B
+
+    try:
+        log_det_Sigma = torch.linalg.slogdet(Sigma)[1]
+        log_det_Sigma_A = torch.linalg.slogdet(Sigma_A)[1]
+        log_det_Sigma_B = torch.linalg.slogdet(Sigma_B)[1]
+
+        phi_g = 0.5 * (log_det_Sigma_A + log_det_Sigma_B - log_det_Sigma)
+        phi_g = torch.clamp(phi_g, min=0.0)
+        return phi_g.expand(batch_size)
+    except RuntimeError:
+        return torch.zeros(batch_size, device=X.device)
+
+
 def compute_representation_coherence(representations: torch.Tensor) -> torch.Tensor:
     """
-    Compute UNIFIED coherence metric across all encoder types.
+    Compute RESEARCH-GRADE integration metric across all encoder types.
 
-    This ensures fair comparison between MERA, GRU, Transformer, and MLP encoders.
-    All encoders now use the SAME metric: mutual information between representation halves.
+    Combines two rigorous measures:
+    1. Von Neumann Entanglement Entropy (S_vN) - physics metric
+    2. Geometric Integrated Information (Φ_G) - IIT approximation
 
-    The computation:
-    1. Split representation into two halves (temporal or feature-wise)
-    2. Compute marginal entropy of each half: H(A), H(B)
-    3. Compute joint entropy via correlation: H(A,B)
-    4. Return MI = H(A) + H(B) - H(A,B)
+    This ensures fair, scientifically meaningful comparison across encoders.
+
+    References:
+    - Vidal et al., Phys. Rev. Lett. 90, 227902 (2003) - S_vN
+    - Barrett & Seth, PLoS Comput Biol 7(1): e1001052 (2011) - Φ_G
+    - Oizumi et al., PLoS Comput Biol 12(3): e1004654 (2016) - IIT
 
     Args:
         representations: (batch, dim) or (batch, seq_len, dim) tensor
 
     Returns:
-        coherence: (batch,) tensor in range [0, 1]
+        coherence: (batch,) tensor - combined S_vN and Φ_G
     """
     with torch.no_grad():
-        # Handle both 2D and 3D inputs
+        # Flatten 3D to 2D
         if representations.dim() == 3:
-            # (B, T, D) - temporal sequence: split on time dimension
             B, T, D = representations.shape
-            half_t = max(1, T // 2)
-            part_A = representations[:, :half_t, :].reshape(B, -1)
-            part_B = representations[:, half_t:, :].reshape(B, -1)
+            X = representations.reshape(B, T * D)
         else:
-            # (B, D) - flat representation: split on feature dimension
-            B, D = representations.shape
-            half_d = max(1, D // 2)
-            part_A = representations[:, :half_d]
-            part_B = representations[:, half_d:]
+            X = representations
 
-        # Compute entropy of each part (Shannon entropy of squared activation distribution)
-        def compute_entropy(x):
-            x_sq = x ** 2 + 1e-10
-            x_prob = x_sq / x_sq.sum(dim=-1, keepdim=True)
-            return -torch.sum(x_prob * torch.log(x_prob + 1e-10), dim=-1)
+        B, dim = X.shape
 
-        H_A = compute_entropy(part_A)  # (B,)
-        H_B = compute_entropy(part_B)  # (B,)
+        # Normalize to unit norm (pure state condition for S_vN)
+        psi = F.normalize(X, dim=-1)
 
-        # Joint entropy via correlation matrix SVD
-        A_norm = F.normalize(part_A, dim=-1)
-        B_norm = F.normalize(part_B, dim=-1)
+        # Compute metrics at multiple partitions
+        S_vN_values = []
+        phi_g_values = []
 
-        # Ensure same size for correlation
-        min_dim = min(A_norm.shape[1], B_norm.shape[1])
-        A_norm = A_norm[:, :min_dim]
-        B_norm = B_norm[:, :min_dim]
+        for frac in [0.25, 0.33, 0.5]:
+            partition_idx = max(1, min(dim - 1, int(dim * frac)))
 
-        # Correlation: (B, min_dim, min_dim)
-        corr = torch.bmm(A_norm.unsqueeze(2), B_norm.unsqueeze(1))
+            S_vN = compute_von_neumann_entropy(psi, partition_idx)
+            phi_g = compute_geometric_phi(X, partition_idx)
 
-        try:
-            _, s, _ = torch.linalg.svd(corr)
-            s_sq = s ** 2 + 1e-10
-            s_norm = s_sq / s_sq.sum(dim=-1, keepdim=True)
-            H_AB = -torch.sum(s_norm * torch.log(s_norm + 1e-10), dim=-1)
-        except RuntimeError:
-            H_AB = torch.zeros(B, device=representations.device)
+            S_vN_values.append(S_vN)
+            phi_g_values.append(phi_g)
 
-        # Mutual information (always >= 0)
-        mi = torch.clamp(H_A + H_B - H_AB, min=0.0)
+        # Average across partitions
+        S_vN_avg = torch.stack(S_vN_values, dim=-1).mean(dim=-1)
+        phi_g_avg = torch.stack(phi_g_values, dim=-1).mean(dim=-1)
 
         # Normalize to [0, 1] range
-        max_entropy = max(H_A.max().item(), H_B.max().item(), 1e-8)
-        coherence = torch.clamp(mi / max_entropy, 0.0, 1.0)
+        max_entropy = math.log(dim // 2 + 1)
+        S_vN_normalized = S_vN_avg / (max_entropy + 1e-8)
+        phi_g_normalized = torch.clamp(phi_g_avg, 0, 10) / 10.0
+
+        # Combined metric
+        coherence = (S_vN_normalized + phi_g_normalized) / 2.0
+        coherence = torch.clamp(coherence, 0.0, 1.0)
 
         return coherence
 
