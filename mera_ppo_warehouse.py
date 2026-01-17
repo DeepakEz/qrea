@@ -231,11 +231,84 @@ class CoordinationMetrics:
 # Neural Network Components
 # =============================================================================
 
+def compute_representation_coherence(representations: torch.Tensor) -> torch.Tensor:
+    """
+    Compute UNIFIED coherence metric across all encoder types.
+
+    This ensures fair comparison between MERA, GRU, Transformer, and MLP encoders.
+    All encoders now use the SAME metric: mutual information between representation halves.
+
+    The computation:
+    1. Split representation into two halves (temporal or feature-wise)
+    2. Compute marginal entropy of each half: H(A), H(B)
+    3. Compute joint entropy via correlation: H(A,B)
+    4. Return MI = H(A) + H(B) - H(A,B)
+
+    Args:
+        representations: (batch, dim) or (batch, seq_len, dim) tensor
+
+    Returns:
+        coherence: (batch,) tensor in range [0, 1]
+    """
+    with torch.no_grad():
+        # Handle both 2D and 3D inputs
+        if representations.dim() == 3:
+            # (B, T, D) - temporal sequence: split on time dimension
+            B, T, D = representations.shape
+            half_t = max(1, T // 2)
+            part_A = representations[:, :half_t, :].reshape(B, -1)
+            part_B = representations[:, half_t:, :].reshape(B, -1)
+        else:
+            # (B, D) - flat representation: split on feature dimension
+            B, D = representations.shape
+            half_d = max(1, D // 2)
+            part_A = representations[:, :half_d]
+            part_B = representations[:, half_d:]
+
+        # Compute entropy of each part (Shannon entropy of squared activation distribution)
+        def compute_entropy(x):
+            x_sq = x ** 2 + 1e-10
+            x_prob = x_sq / x_sq.sum(dim=-1, keepdim=True)
+            return -torch.sum(x_prob * torch.log(x_prob + 1e-10), dim=-1)
+
+        H_A = compute_entropy(part_A)  # (B,)
+        H_B = compute_entropy(part_B)  # (B,)
+
+        # Joint entropy via correlation matrix SVD
+        A_norm = F.normalize(part_A, dim=-1)
+        B_norm = F.normalize(part_B, dim=-1)
+
+        # Ensure same size for correlation
+        min_dim = min(A_norm.shape[1], B_norm.shape[1])
+        A_norm = A_norm[:, :min_dim]
+        B_norm = B_norm[:, :min_dim]
+
+        # Correlation: (B, min_dim, min_dim)
+        corr = torch.bmm(A_norm.unsqueeze(2), B_norm.unsqueeze(1))
+
+        try:
+            _, s, _ = torch.linalg.svd(corr)
+            s_sq = s ** 2 + 1e-10
+            s_norm = s_sq / s_sq.sum(dim=-1, keepdim=True)
+            H_AB = -torch.sum(s_norm * torch.log(s_norm + 1e-10), dim=-1)
+        except RuntimeError:
+            H_AB = torch.zeros(B, device=representations.device)
+
+        # Mutual information (always >= 0)
+        mi = torch.clamp(H_A + H_B - H_AB, min=0.0)
+
+        # Normalize to [0, 1] range
+        max_entropy = max(H_A.max().item(), H_B.max().item(), 1e-8)
+        coherence = torch.clamp(mi / max_entropy, 0.0, 1.0)
+
+        return coherence
+
+
 class MLPEncoder(nn.Module):
     """Baseline MLP encoder for comparison.
 
-    NOTE: MLP flattens temporal history, losing structure. For fair comparison,
-    we compute a representation coherence metric based on output activation patterns.
+    NOTE: MLP flattens temporal history, losing structure.
+    Uses unified coherence metric for fair comparison with other encoders.
     """
 
     def __init__(self, input_dim: int, output_dim: int, hidden_dims: List[int] = [256, 256]):
@@ -254,17 +327,10 @@ class MLPEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
         latent = self.net(x)
 
-        # Compute representation coherence (analogous to phi_q)
-        # For MLP, measure how "structured" the output is via activation sparsity
-        with torch.no_grad():
-            # Normalized activation magnitude variance (higher = more structured)
-            latent_norm = F.normalize(latent, dim=-1)
-            # Variance of squared activations (Gini-like sparsity)
-            coherence = latent_norm.pow(2).var(dim=-1)  # (B,)
-            # Scale to reasonable range [0, 1]
-            coherence = torch.clamp(coherence * 10, 0, 1)
+        # FIX: Use unified coherence metric for fair comparison across encoders
+        coherence = compute_representation_coherence(latent)
 
-        return latent, {'phi_q': coherence.detach()}
+        return latent, {'phi_q': coherence}
 
 
 class GRUEncoder(nn.Module):
@@ -310,19 +376,11 @@ class GRUEncoder(nn.Module):
         latent = h_n[-1]  # (B, H)
         latent = self.output_projection(latent)
 
-        # Compute temporal coherence metric (analogous to phi_q for fair comparison)
-        # Measures correlation between hidden states across time
-        with torch.no_grad():
-            # Compute correlation between first and last half of sequence
-            T = gru_out.shape[1]
-            first_half = gru_out[:, :T//2, :].mean(dim=1)  # (B, H)
-            second_half = gru_out[:, T//2:, :].mean(dim=1)  # (B, H)
-            # Cosine similarity as coherence measure
-            coherence = F.cosine_similarity(first_half, second_half, dim=-1)  # (B,)
-            # Map to [0, 1] range
-            temporal_coherence = (coherence + 1) / 2
+        # FIX: Use unified coherence metric for fair comparison across encoders
+        # Pass gru_out (B, T, H) for temporal coherence computation
+        coherence = compute_representation_coherence(gru_out)
 
-        return latent, {'phi_q': temporal_coherence.detach()}
+        return latent, {'phi_q': coherence}
 
 
 class TransformerEncoder(nn.Module):
@@ -385,20 +443,11 @@ class TransformerEncoder(nn.Module):
         latent = x.mean(dim=1)  # (B, d_model)
         latent = self.output_projection(latent)
 
-        # Compute temporal coherence metric (analogous to phi_q for fair comparison)
-        # Measures how structured/correlated the transformer output is across time
-        with torch.no_grad():
-            # Compute pairwise cosine similarity between time steps
-            x_norm = F.normalize(x, dim=-1)  # (B, T, d_model)
-            # Self-similarity matrix
-            sim_matrix = torch.bmm(x_norm, x_norm.transpose(1, 2))  # (B, T, T)
-            # Average off-diagonal similarity (temporal coherence)
-            mask = ~torch.eye(seq_len, dtype=torch.bool, device=x.device)
-            temporal_coherence = sim_matrix[:, mask].mean(dim=-1)  # (B,)
-            # Already in [-1, 1], map to [0, 1]
-            temporal_coherence = (temporal_coherence + 1) / 2
+        # FIX: Use unified coherence metric for fair comparison across encoders
+        # Pass transformer output (B, T, d_model) for temporal coherence computation
+        coherence = compute_representation_coherence(x)
 
-        return latent, {'phi_q': temporal_coherence.detach()}
+        return latent, {'phi_q': coherence}
 
 
 class MERAEncoder(nn.Module):

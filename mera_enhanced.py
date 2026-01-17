@@ -315,6 +315,25 @@ class HierarchicalEntropyComputer(nn.Module):
     """
     Compute a hierarchical correlation metric from tensor network states.
 
+    IMPORTANT - DENSITY MATRIX VS CORRELATION MATRIX
+    ================================================
+    This implementation uses CORRELATION MATRICES, not true quantum density matrices:
+
+    - True density matrix: ρ = |ψ⟩⟨ψ| (outer product of state with itself)
+    - Our approach: C_ij = ⟨site_i, site_j⟩ (inner products / correlation)
+
+    The key differences:
+    1. Density matrices encode full quantum state including phases
+    2. Correlation matrices only capture pairwise statistical correlations
+    3. True IIT Φ requires density matrix formalism
+    4. Our mutual information approximation uses SVD of correlations
+
+    Why we use correlations:
+    - Neural network activations are real-valued, not complex quantum states
+    - Correlation-based MI is computationally tractable
+    - Still captures "integration" in a meaningful statistical sense
+    - Provides consistent metric across MERA/GRU/Transformer/MLP encoders
+
     NOTE: This is NOT integrated information (IIT) or quantum entanglement.
     It computes SVD-based entropy of correlation matrices between layer sites,
     which measures how correlated different parts of the representation are.
@@ -323,9 +342,9 @@ class HierarchicalEntropyComputer(nn.Module):
     during training, but should not be interpreted as a consciousness measure.
 
     FIX: Improved computation to be more meaningful:
-    - Uses proper reduced density matrix approximation (outer product)
-    - Computes mutual information instead of raw entropy difference
-    - Returns absolute value to ensure non-negative (integration is always >= 0)
+    - Uses mutual information: MI = H(A) + H(B) - H(A,B)
+    - Ensures non-negative (MI is always >= 0 by definition)
+    - Now unified with other encoders for fair comparison
     """
 
     def __init__(self, min_sites: int = 2):
