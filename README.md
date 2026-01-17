@@ -41,11 +41,18 @@ python run_experiments.py --compare all --seeds 3 --epochs 100
 
 ## Key Metrics
 
+### Performance Metrics
 - **Pickups**: Packages picked up per episode
 - **Deliveries**: Packages delivered per episode
 - **Collisions**: Robot-robot collisions
 - **Throughput**: Packages delivered per hour
-- **Φ_Q**: Hierarchical entropy metric (correlation-based diagnostic)
+
+### Research-Grade Metrics (for publication)
+- **S_vN**: Von Neumann Entanglement Entropy - measures quantum entanglement in representations
+  - Reference: Vidal et al., Phys. Rev. Lett. 90, 227902 (2003)
+- **Φ_G**: Geometric Integrated Information - IIT approximation measuring information integration
+  - Reference: Barrett & Seth, PLoS Comput Biol 7(1): e1001052 (2011)
+- **Φ_Q**: Combined metric = (S_vN + Φ_G) / 2 (diagnostic probe, not optimized)
 
 ## Configuration
 
@@ -106,7 +113,11 @@ qrea/
 
 ## Research Notes
 
-- **Φ_Q** is a diagnostic probe, not optimized directly
+- **Research Metrics**: S_vN and Φ_G are computed for each encoder, enabling fair comparison
+- **Φ_Q** is a diagnostic probe (combined S_vN + Φ_G), not optimized directly
+- **Primary Claim**: MERA tensor networks provide better multi-agent coordination than standard encoders
+- **Evidence**: Compare performance (deliveries, throughput) across encoders with statistical significance
+- **Analysis**: Use S_vN and Φ_G to understand WHY MERA works (or doesn't)
 - Dense rewards used for learning, sparse for evaluation
 - MERA provides hierarchical temporal encoding
 - UPRT provides spatial coordination context
