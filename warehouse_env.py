@@ -751,8 +751,10 @@ class WarehouseEnv(gym.Env):
                             self._progress_history[robot.id].pop(0)
 
                         # Scale: ~15.0 reward per meter moved toward destination
-                        progress_reward = 15.0 * progress_delta
-                        reward += progress_reward  # Can be negative if moving away!
+                        # FIX: Bound negative progress to prevent catastrophic penalties
+                        # Allows mild punishment for wrong direction but not runaway negatives
+                        progress_reward = np.clip(15.0 * progress_delta, -5.0, 15.0)
+                        reward += progress_reward
 
                         # ANTI-OSCILLATION: Penalize if net progress over window is near zero
                         # This prevents agents from oscillating to harvest rewards
@@ -842,12 +844,19 @@ class WarehouseEnv(gym.Env):
     
     def get_statistics(self) -> dict:
         """Get environment statistics"""
+        # FIX: Aggregate energy stats from robots (was never done before)
+        # This makes the 'efficiency' metric actually meaningful
+        total_energy = sum(robot.energy_consumed for robot in self.robots)
+        total_distance = sum(robot.distance_traveled for robot in self.robots)
+
         return {
             **self.stats,
+            'total_energy': total_energy,  # FIX: Override with actual aggregated value
+            'total_distance': total_distance,  # FIX: Add actual distance
             'throughput': self.stats['packages_delivered'] / (self.current_step * self.dt + 1e-6) * 3600,
             'avg_waiting_time': self.stats['total_waiting_time'] / (self.stats['packages_delivered'] + 1e-6),
-            'avg_distance': self.stats['total_distance'] / (self.stats['packages_delivered'] + 1e-6),
-            'efficiency': self.stats['packages_delivered'] / (self.stats['total_energy'] + 1e-6)
+            'avg_distance': total_distance / (self.stats['packages_delivered'] + 1e-6),
+            'efficiency': self.stats['packages_delivered'] / (total_energy + 1e-6)
         }
 
     def get_global_state_snapshot(self) -> dict:

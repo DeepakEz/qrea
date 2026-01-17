@@ -206,8 +206,9 @@ class TrueIsometry(nn.Module):
         Uses torch.nn.init.orthogonal_ to ensure W†W = I exactly at initialization.
         This prevents signal vanishing through layers - critical for RG eigenvalues > 0.3.
 
-        Added noise (0.3) to break symmetry and enable Φ_Q computation.
-        Without noise, identity init = zero entanglement = Φ_Q stays at 0.
+        FIX: Previous version added noise after orthogonal init, destroying isometry.
+        New approach: Use orthogonal init with small perturbation that PRESERVES isometry.
+        We re-orthogonalize after adding noise to maintain W†W ≈ I.
         """
         # Shape: (d_out, d_in * d_in) - treat as matrix for orthogonal init
         flat = torch.empty(d_out, d_in * d_in)
@@ -216,11 +217,15 @@ class TrueIsometry(nn.Module):
         # This guarantees W†W = I (for the smaller dimension)
         nn.init.orthogonal_(flat)
 
-        # Add noise to break symmetry and enable entanglement/Φ_Q
-        # Without this, pure identity init means zero entanglement
-        # Increased from 0.3 to 0.5 for stronger initial structure and faster Φ_Q emergence
-        noise = torch.randn(d_out, d_in * d_in) * 0.5
+        # Add small noise to break symmetry and enable entanglement/Φ_Q
+        # FIX: Use SMALLER noise (0.1 instead of 0.5) to not destroy isometry structure
+        noise = torch.randn(d_out, d_in * d_in) * 0.1
         flat = flat + noise
+
+        # FIX: Re-orthogonalize after adding noise to maintain isometry constraint
+        # SVD re-orthogonalization: U @ V.T gives closest orthonormal matrix
+        U, S, Vh = torch.linalg.svd(flat, full_matrices=False)
+        flat = U @ Vh  # This is the closest orthonormal matrix to flat
 
         # Reshape back to tensor form
         return flat.reshape(d_out, d_in, d_in)
@@ -640,7 +645,11 @@ class EnhancedTensorNetworkMERA(nn.Module):
         for i, site_after in enumerate(sites_after):
             if 2*i + 1 < len(sites_before):
                 s1, s2 = sites_before[2*i], sites_before[2*i+1]
-                norm_before = torch.norm(s1, dim=-1) + torch.norm(s2, dim=-1)
+                # FIX: Compute proper combined norm using Frobenius norm of concatenated sites
+                # Previous: added norms (||s1|| + ||s2||) which overstates input magnitude
+                # Correct: sqrt(||s1||² + ||s2||²) = ||concat(s1,s2)||
+                combined = torch.cat([s1, s2], dim=-1)  # (batch, 2*d)
+                norm_before = torch.norm(combined, dim=-1)  # Proper Frobenius norm
                 norm_after = torch.norm(site_after, dim=-1)
 
                 # Avoid division by zero

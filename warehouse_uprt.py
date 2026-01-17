@@ -143,8 +143,9 @@ class UPRTField(nn.Module):
             self.activity_field, self.diffusion_coeff, dt
         )
         
-        # Decay
-        self.activity_field *= (1 - self.decay_rate * dt)
+        # Decay - FIX: Clamp multiplier to [0, 1] to prevent negative values
+        decay_mult = max(0.0, 1 - self.decay_rate * dt)
+        self.activity_field *= decay_mult
         
         # Update interaction field (pairwise proximity/similarity)
         self._update_interaction_field(robot_positions, robot_activities, dt)
@@ -181,11 +182,12 @@ class UPRTField(nn.Module):
         """Update interaction field based on pairwise robot proximity/similarity (vectorized)"""
         N = positions.shape[0]
         if N < 2:
-            # No pairs to process
+            # No pairs to process - FIX: Clamp decay multiplier
             self.interaction_field = self._apply_diffusion(
                 self.interaction_field, self.diffusion_coeff * 2, dt
             )
-            self.interaction_field *= (1 - self.decay_rate * 0.5 * dt)
+            decay_mult = max(0.0, 1 - self.decay_rate * 0.5 * dt)
+            self.interaction_field *= decay_mult
             return
 
         # Vectorized pairwise distance computation - O(N²) but in parallel
@@ -234,11 +236,12 @@ class UPRTField(nn.Module):
             field_flat.scatter_add_(0, flat_idx.unsqueeze(-1).expand(-1, field_flat.shape[-1]), resonance_contrib)
             self.interaction_field = field_flat.view(*self.interaction_field.shape)
 
-        # Diffuse and decay
+        # Diffuse and decay - FIX: Clamp multiplier to [0, 1]
         self.interaction_field = self._apply_diffusion(
             self.interaction_field, self.diffusion_coeff * 2, dt
         )
-        self.interaction_field *= (1 - self.decay_rate * 0.5 * dt)
+        decay_mult = max(0.0, 1 - self.decay_rate * 0.5 * dt)
+        self.interaction_field *= decay_mult
     
     def _update_memory_field(self, positions: torch.Tensor,
                              activities: torch.Tensor, dt: float):
@@ -260,8 +263,9 @@ class UPRTField(nn.Module):
         field_flat.scatter_add_(0, flat_idx.unsqueeze(-1).expand(-1, 32), activity_contrib)
         self.memory_field = field_flat.view(*self.memory_field.shape)
 
-        # Slower decay for long-term memory
-        self.memory_field *= (1 - self.decay_rate * 0.1 * dt)
+        # Slower decay for long-term memory - FIX: Clamp multiplier
+        decay_mult = max(0.0, 1 - self.decay_rate * 0.1 * dt)
+        self.memory_field *= decay_mult
     
     def _compute_similarity(self, act1: torch.Tensor, act2: torch.Tensor) -> torch.Tensor:
         """Compute similarity between two activity patterns"""
@@ -291,9 +295,12 @@ class UPRTField(nn.Module):
         # Encode observations to pattern space
         embeddings = self.pattern_encoder(observations)
         embeddings = F.normalize(embeddings, dim=-1)
-        
+
         # Compute similarity to prototypes
-        similarities = torch.matmul(embeddings, self.symbol_prototypes.t())
+        # FIX: Normalize prototypes for consistent similarity computation
+        # (was inconsistent with emerge_new_symbol which normalized)
+        prototypes_norm = F.normalize(self.symbol_prototypes, dim=-1)
+        similarities = torch.matmul(embeddings, prototypes_norm.t())
         
         # Detect matches
         max_sims, best_protos = similarities.max(dim=-1)
@@ -337,13 +344,17 @@ class UPRTField(nn.Module):
         self.next_symbol_id += 1
         
         # Update prototypes (add new or replace least used)
+        # FIX: Ensure idx never exceeds num_prototypes - 1 (was causing OOB)
         if len(self.symbols) <= self.num_prototypes:
-            idx = len(self.symbols) - 1
+            idx = min(len(self.symbols) - 1, self.num_prototypes - 1)
         else:
-            # Replace least used symbol
-            idx = min(range(len(self.symbols)), 
-                     key=lambda i: self.symbols[i].usage_count)
-        
+            # Replace least used symbol - but only consider those within prototype range
+            valid_indices = range(min(len(self.symbols), self.num_prototypes))
+            idx = min(valid_indices, key=lambda i: self.symbols[i].usage_count)
+
+        # Safety check: ensure idx is valid
+        idx = max(0, min(idx, self.num_prototypes - 1))
+
         with torch.no_grad():
             self.symbol_prototypes[idx] = embedding
         

@@ -968,7 +968,14 @@ class MERAWarehousePPO:
         return robot_transitions, {'env_stats': epoch_env_stats, 'epoch_reward': epoch_total_reward}
 
     def compute_returns(self, transitions: List[Transition]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute GAE returns and advantages"""
+        """Compute GAE returns and advantages.
+
+        FIX: Proper bootstrap value handling for multi-episode rollouts:
+        - If last transition is terminal (done=True): next_value = 0
+        - If last transition is NOT terminal (truncated): next_value = V(s_last)
+
+        This ensures we don't treat truncated rollouts as having zero future value.
+        """
         rewards = [t.reward for t in transitions]
         values = [t.value for t in transitions]
         dones = [t.done for t in transitions]
@@ -977,7 +984,14 @@ class MERAWarehousePPO:
         gae = 0.0
 
         for t in reversed(range(len(transitions))):
-            next_value = 0.0 if t == len(transitions) - 1 else values[t + 1]
+            if t == len(transitions) - 1:
+                # FIX: For last transition, check if it was terminal or truncated
+                # If truncated (not done), bootstrap from last value estimate
+                # If terminal (done), next_value = 0
+                next_value = 0.0 if dones[t] else values[t]
+            else:
+                next_value = values[t + 1]
+
             delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - values[t]
             gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
             returns.insert(0, gae + values[t])
@@ -985,7 +999,10 @@ class MERAWarehousePPO:
 
         returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
         advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
+
+        # FIX: Normalize both advantages AND returns for stable value learning
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
         return returns, advantages
 
