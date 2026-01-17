@@ -113,46 +113,54 @@ class UPRTField(nn.Module):
         self.next_symbol_id = 0
         self.timestep = 0
     
-    def update_fields(self, robot_positions: torch.Tensor, 
+    def update_fields(self, robot_positions: torch.Tensor,
                      robot_activities: torch.Tensor,
                      dt: float = 0.1):
         """
         Update field dynamics
-        
+
         Args:
             robot_positions: [N, 2] positions in world coords
             robot_activities: [N, D] activity vectors
         """
+        # FIX: Maximum field value to prevent overflow
+        MAX_FIELD_VALUE = 100.0
+
         # Convert world coords to grid coords using config world_size
         world_size = self.world_size.to(robot_positions.device)
         grid_x = (robot_positions[:, 0] / world_size[0] * self.grid_resolution[0]).long()
         grid_y = (robot_positions[:, 1] / world_size[1] * self.grid_resolution[1]).long()
-        
+
         grid_x = torch.clamp(grid_x, 0, self.grid_resolution[0] - 1)
         grid_y = torch.clamp(grid_y, 0, self.grid_resolution[1] - 1)
-        
+
         # Update activity field (spatial activity accumulator) - vectorized
         flat_idx = grid_x * self.grid_resolution[1] + grid_y  # (N,)
         field_flat = self.activity_field.view(-1, self.activity_field.shape[-1])  # (H*W, 16)
         activity_contrib = robot_activities[:, :16] * dt  # (N, 16)
         field_flat.scatter_add_(0, flat_idx.unsqueeze(-1).expand(-1, 16), activity_contrib)
         self.activity_field = field_flat.view(*self.activity_field.shape)
-        
+
         # Diffusion
         self.activity_field = self._apply_diffusion(
             self.activity_field, self.diffusion_coeff, dt
         )
-        
+
         # Decay - FIX: Clamp multiplier to [0, 1] to prevent negative values
         decay_mult = max(0.0, 1 - self.decay_rate * dt)
         self.activity_field *= decay_mult
-        
+
         # Update interaction field (pairwise proximity/similarity)
         self._update_interaction_field(robot_positions, robot_activities, dt)
 
         # Update memory field (long-term activity accumulation)
         self._update_memory_field(robot_positions, robot_activities, dt)
-        
+
+        # FIX: Clamp all fields to prevent overflow
+        self.activity_field = torch.clamp(self.activity_field, -MAX_FIELD_VALUE, MAX_FIELD_VALUE)
+        self.interaction_field = torch.clamp(self.interaction_field, -MAX_FIELD_VALUE, MAX_FIELD_VALUE)
+        self.memory_field = torch.clamp(self.memory_field, -MAX_FIELD_VALUE, MAX_FIELD_VALUE)
+
         self.timestep += 1
     
     def _apply_diffusion(self, field: torch.Tensor, coeff: float, dt: float) -> torch.Tensor:

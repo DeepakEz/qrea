@@ -1007,7 +1007,11 @@ class MERAWarehousePPO:
         return returns, advantages
 
     def update(self, robot_transitions: Dict[int, List[Transition]]):
-        """PPO update step"""
+        """PPO update step with value clipping.
+
+        FIX: Added PPO value clipping to prevent large value function updates.
+        This is standard in PPO implementations (OpenAI, CleanRL, etc.)
+        """
         all_transitions = []
         for i in range(self.num_robots):
             all_transitions.extend(robot_transitions[i])
@@ -1021,6 +1025,9 @@ class MERAWarehousePPO:
                               dtype=torch.float32, device=self.device)
         old_log_probs = torch.tensor([t.log_prob for t in all_transitions],
                                      dtype=torch.float32, device=self.device)
+        # FIX: Store old values for value clipping
+        old_values = torch.tensor([t.value for t in all_transitions],
+                                  dtype=torch.float32, device=self.device)
 
         # Extract robot positions for mera_uprt encoder
         if self.encoder_type == 'mera_uprt' and all_transitions[0].robot_position is not None:
@@ -1061,6 +1068,7 @@ class MERAWarehousePPO:
                 batch_obs = obs[batch_idx]
                 batch_actions = actions[batch_idx]
                 batch_old_log_probs = old_log_probs[batch_idx]
+                batch_old_values = old_values[batch_idx]  # FIX: Get old values
                 batch_returns = returns[batch_idx]
                 batch_advantages = advantages[batch_idx]
                 batch_positions = robot_positions[batch_idx] if robot_positions is not None else None
@@ -1069,13 +1077,23 @@ class MERAWarehousePPO:
                     batch_obs, batch_actions, batch_positions
                 )
 
+                # Policy loss with clipping
                 ratio = torch.exp(log_probs - batch_old_log_probs)
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon,
                                     1 + self.clip_epsilon) * batch_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                value_loss = F.mse_loss(values, batch_returns)
+                # FIX: Value loss with clipping (standard PPO technique)
+                # Prevents large value function updates that can destabilize training
+                values_clipped = batch_old_values + torch.clamp(
+                    values - batch_old_values,
+                    -self.clip_epsilon, self.clip_epsilon
+                )
+                value_loss_unclipped = (values - batch_returns) ** 2
+                value_loss_clipped = (values_clipped - batch_returns) ** 2
+                value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+
                 entropy_loss = -entropy.mean()
 
                 # MERA constraint losses (isometry, scale consistency)

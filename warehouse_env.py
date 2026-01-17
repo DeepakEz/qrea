@@ -309,28 +309,34 @@ class WarehouseEnv(gym.Env):
     def _apply_action(self, robot: Robot, action: np.ndarray):
         """Apply action to robot"""
         linear_vel, angular_vel, gripper = action
-        
+
         # Clip actions
         linear_vel = np.clip(linear_vel, -self.max_speed, self.max_speed)
         angular_vel = np.clip(angular_vel, -self.max_angular_vel, self.max_angular_vel)
-        
+
         # Update velocity (with acceleration limits)
         target_vel = np.array([
             linear_vel * np.cos(robot.orientation),
             linear_vel * np.sin(robot.orientation)
         ])
-        
+
         vel_diff = target_vel - robot.velocity
         max_vel_change = self.max_acceleration * self.dt
-        
+
         if np.linalg.norm(vel_diff) > max_vel_change:
             vel_diff = vel_diff / np.linalg.norm(vel_diff) * max_vel_change
-        
+
         robot.velocity = robot.velocity + vel_diff
-        
-        # Update angular velocity
-        robot.angular_velocity = angular_vel
-        
+
+        # FIX: Update angular velocity with acceleration limiting
+        # Previously: robot.angular_velocity = angular_vel (instantaneous change)
+        # Now: limit angular acceleration to prevent unrealistic instant rotation
+        max_angular_accel = 3.0  # rad/s² - reasonable for wheeled robot
+        angular_diff = angular_vel - robot.angular_velocity
+        max_angular_change = max_angular_accel * self.dt
+        angular_diff = np.clip(angular_diff, -max_angular_change, max_angular_change)
+        robot.angular_velocity = robot.angular_velocity + angular_diff
+
         # Handle gripper - agent must LEARN to use gripper action
         # No auto-pickup: research validity requires natural learning
         should_try_pickup = gripper > 0.5
@@ -504,23 +510,49 @@ class WarehouseEnv(gym.Env):
             self.next_package_id += 1
     
     def _check_collisions(self):
-        """Check and handle robot-robot collisions"""
+        """Check and handle robot-robot collisions with proper physics.
+
+        FIX: Added elastic collision response with momentum conservation.
+        Previously only pushed robots apart without velocity exchange.
+        """
         for i, robot1 in enumerate(self.robots):
             for robot2 in self.robots[i+1:]:
                 dist = np.linalg.norm(robot1.position - robot2.position)
                 min_dist = 2 * self.robot_radius
-                
+
                 if dist < min_dist:
                     # Collision detected
                     robot1.collision_count += 1
                     robot2.collision_count += 1
                     self.stats['collisions'] += 1
-                    
-                    # Push apart
+
+                    # Collision normal (from robot1 to robot2)
+                    normal = (robot2.position - robot1.position) / (dist + 1e-6)
+
+                    # Push apart (position correction)
                     overlap = min_dist - dist
-                    direction = (robot2.position - robot1.position) / (dist + 1e-6)
-                    robot1.position -= direction * overlap * 0.5
-                    robot2.position += direction * overlap * 0.5
+                    robot1.position -= normal * overlap * 0.5
+                    robot2.position += normal * overlap * 0.5
+
+                    # FIX: Elastic collision response (momentum + energy conservation)
+                    # For equal mass robots, this simplifies to velocity component exchange
+                    # along collision normal
+                    v1_normal = np.dot(robot1.velocity, normal)
+                    v2_normal = np.dot(robot2.velocity, normal)
+
+                    # Only respond if robots are approaching (avoid double-response)
+                    relative_vel = v1_normal - v2_normal
+                    if relative_vel > 0:
+                        # Coefficient of restitution (1.0 = perfectly elastic, 0.5 = some energy loss)
+                        restitution = 0.7
+
+                        # For equal masses: exchange velocity components along normal
+                        # v1_new = v1 - (1+e)/2 * (v1-v2)·n * n
+                        # v2_new = v2 + (1+e)/2 * (v1-v2)·n * n
+                        impulse = (1 + restitution) * relative_vel * 0.5
+
+                        robot1.velocity -= impulse * normal
+                        robot2.velocity += impulse * normal
     
     def _get_observation(self, robot: Robot) -> np.ndarray:
         """Get observation for a robot"""

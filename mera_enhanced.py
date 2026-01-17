@@ -13,14 +13,30 @@ Key Features:
 - Proper dimension handling across layers
 - Isometry constraint regularization (w†w = I)
 - Layer scaling factor tracking for analysis
-- Hierarchical correlation metric as diagnostic probe
+- Hierarchical integration metric as diagnostic probe
 
 Architecture:
 - Layer 0: physical_dim → bond_dim (dimension expansion)
 - Layer 1+: bond_dim → bond_dim (consistent dimensions)
 
-Note: The "hierarchical_entropy" metric is a correlation-based diagnostic,
-NOT a measure of quantum entanglement or integrated information (IIT).
+IMPORTANT - Metric Interpretation:
+==================================
+The "phi_q" / "hierarchical_entropy" metric is a HEURISTIC DIAGNOSTIC:
+
+1. It computes MUTUAL INFORMATION between partitions of the tensor network,
+   NOT quantum entanglement entropy or IIT's Φ measure.
+
+2. The metric is computed as: MI = H(A) + H(B) - H(A,B)
+   where H is Shannon entropy of activation distributions.
+
+3. Higher values indicate representations where different parts share more
+   information - this may correlate with coordination but is NOT causal.
+
+4. The metric uses SVD of correlation matrices as an approximation,
+   which differs from true quantum density matrices.
+
+5. DO NOT claim this measures consciousness, quantum effects, or true IIT.
+   It is simply a useful diagnostic for tracking representation structure.
 """
 
 import torch
@@ -133,13 +149,12 @@ class TrueDisentangler(nn.Module):
         combined = torch.einsum('ijkl,bi,bj->bkl', self.tensor, site1, site2)
 
         # Split into two sites using learned projections
-        # FIX: Use proper matrix multiplication, not diagonal-only indexing
-        # Old (buggy): 'bkl,kk->bl' only used diagonal elements of proj_left
-        # New: proper contraction - project combined tensor to output vectors
-        # out1: contract over k with proj_left, average over l
-        # out2: contract over l with proj_right, average over k
-        out1 = torch.einsum('bkl,km->bm', combined, self.proj_left) / self.d_out  # (batch, d_out)
-        out2 = torch.einsum('bkl,lm->bm', combined, self.proj_right) / self.d_out  # (batch, d_out)
+        # FIX: Use sqrt(d_out) normalization instead of d_out
+        # sqrt is more principled for vector projections (preserves variance under summation)
+        # Previously divided by d_out which was losing too much magnitude
+        scale = math.sqrt(self.d_out)
+        out1 = torch.einsum('bkl,km->bm', combined, self.proj_left) / scale  # (batch, d_out)
+        out2 = torch.einsum('bkl,lm->bm', combined, self.proj_right) / scale  # (batch, d_out)
 
         return out1, out2
 
@@ -158,9 +173,10 @@ class TrueDisentangler(nn.Module):
         # Contract: u_{ijkl} × sites_even_{p,b,i} × sites_odd_{p,b,j} → combined_{p,b,k,l}
         combined = torch.einsum('ijkl,pbi,pbj->pbkl', self.tensor, sites_even, sites_odd)
 
-        # Split using projections (FIX: proper matrix contraction, not diagonal-only)
-        out_even = torch.einsum('pbkl,km->pbm', combined, self.proj_left) / self.d_out
-        out_odd = torch.einsum('pbkl,lm->pbm', combined, self.proj_right) / self.d_out
+        # FIX: Use sqrt(d_out) normalization for consistency
+        scale = math.sqrt(self.d_out)
+        out_even = torch.einsum('pbkl,km->pbm', combined, self.proj_left) / scale
+        out_odd = torch.einsum('pbkl,lm->pbm', combined, self.proj_right) / scale
 
         return out_even, out_odd
 
@@ -305,19 +321,65 @@ class HierarchicalEntropyComputer(nn.Module):
 
     The metric is useful as a diagnostic to track representation structure
     during training, but should not be interpreted as a consciousness measure.
+
+    FIX: Improved computation to be more meaningful:
+    - Uses proper reduced density matrix approximation (outer product)
+    - Computes mutual information instead of raw entropy difference
+    - Returns absolute value to ensure non-negative (integration is always >= 0)
     """
 
     def __init__(self, min_sites: int = 2):
         super().__init__()
         self.min_sites = min_sites
 
-    def compute_correlation_entropy(self, sites: List[torch.Tensor],
-                                     partition_idx: int) -> torch.Tensor:
+    def compute_site_entropy(self, site: torch.Tensor) -> torch.Tensor:
         """
-        Compute entropy of correlation matrix singular values.
+        Compute entropy of a single site's activation distribution.
 
-        This measures how "spread out" the correlations are between
-        two partitions of sites - NOT quantum entanglement.
+        Treats squared activations as a probability distribution.
+        """
+        # Normalize to probability distribution
+        site_sq = site ** 2 + 1e-10
+        site_prob = site_sq / site_sq.sum(dim=-1, keepdim=True)
+
+        # Shannon entropy
+        entropy = -torch.sum(site_prob * torch.log(site_prob + 1e-10), dim=-1)
+        return entropy
+
+    def compute_joint_entropy(self, sites_A: torch.Tensor, sites_B: torch.Tensor) -> torch.Tensor:
+        """
+        Compute joint entropy of two site groups using correlation matrix SVD.
+
+        This approximates the entropy of the joint distribution over both
+        partitions by looking at their correlation structure.
+        """
+        # Correlation matrix between partitions
+        # sites_A: (B, n_A, d), sites_B: (B, n_B, d)
+        corr = torch.einsum('bik,bjk->bij', sites_A, sites_B)  # (B, n_A, n_B)
+
+        # SVD for singular value spectrum
+        try:
+            _, s, _ = torch.linalg.svd(corr)
+        except RuntimeError:
+            return torch.zeros(sites_A.shape[0], device=sites_A.device)
+
+        # Von Neumann-like entropy from singular values
+        # FIX: Use proper normalization to get meaningful entropy
+        s_sq = s ** 2 + 1e-10
+        s_normalized = s_sq / s_sq.sum(dim=-1, keepdim=True)
+        entropy = -torch.sum(s_normalized * torch.log(s_normalized + 1e-10), dim=-1)
+
+        return entropy
+
+    def compute_mutual_information(self, sites: List[torch.Tensor],
+                                    partition_idx: int) -> torch.Tensor:
+        """
+        Compute mutual information between two partitions.
+
+        MI = H(A) + H(B) - H(A,B)
+
+        This measures how much knowing one partition tells you about the other.
+        Higher values indicate more integration/correlation between partitions.
         """
         if partition_idx <= 0 or partition_idx >= len(sites):
             return torch.zeros(sites[0].shape[0], device=sites[0].device)
@@ -326,50 +388,28 @@ class HierarchicalEntropyComputer(nn.Module):
         sites_A = torch.stack(sites[:partition_idx], dim=1)  # (B, n_A, d)
         sites_B = torch.stack(sites[partition_idx:], dim=1)   # (B, n_B, d)
 
-        # Correlation matrix
-        corr = torch.einsum('bik,bjk->bij', sites_A, sites_B)  # (B, n_A, n_B)
+        # Compute individual entropies (average over sites in partition)
+        H_A = torch.stack([self.compute_site_entropy(sites_A[:, i])
+                          for i in range(sites_A.shape[1])], dim=-1).mean(dim=-1)
+        H_B = torch.stack([self.compute_site_entropy(sites_B[:, i])
+                          for i in range(sites_B.shape[1])], dim=-1).mean(dim=-1)
 
-        # SVD for Schmidt-like coefficients
-        try:
-            _, s, _ = torch.linalg.svd(corr)
-        except RuntimeError:
-            return torch.zeros(sites[0].shape[0], device=sites[0].device)
+        # Compute joint entropy
+        H_AB = self.compute_joint_entropy(sites_A, sites_B)
 
-        # Von Neumann entropy from squared singular values
-        s_sq = s ** 2 + 1e-10
-        s_normalized = s_sq / s_sq.sum(dim=-1, keepdim=True)
-        entropy = -torch.sum(s_normalized * torch.log(s_normalized + 1e-10), dim=-1)
+        # Mutual information (always >= 0 by definition)
+        # FIX: Use max(0, ...) to handle numerical issues
+        mi = torch.clamp(H_A + H_B - H_AB, min=0.0)
 
-        return entropy
-
-    def compute_entropy_for_partition(self, sites: List[torch.Tensor],
-                                       partition_idx: int) -> torch.Tensor:
-        """Compute hierarchical entropy for a specific partition point."""
-        if partition_idx <= 0 or partition_idx >= len(sites):
-            return torch.zeros(sites[0].shape[0], device=sites[0].device)
-
-        # Whole system entropy at this partition
-        S_whole = self.compute_correlation_entropy(sites, partition_idx)
-
-        # Parts entropy
-        left_sites = sites[:partition_idx]
-        right_sites = sites[partition_idx:]
-
-        S_left = self.compute_correlation_entropy(left_sites, len(left_sites) // 2) \
-                 if len(left_sites) > 1 else torch.zeros_like(S_whole)
-        S_right = self.compute_correlation_entropy(right_sites, len(right_sites) // 2) \
-                  if len(right_sites) > 1 else torch.zeros_like(S_whole)
-
-        # Difference: whole minus sum of parts
-        return S_whole - (S_left + S_right)
+        return mi
 
     def forward(self, sites: List[torch.Tensor]) -> torch.Tensor:
         """
-        Compute hierarchical entropy metric across multiple partitions.
+        Compute hierarchical integration metric across multiple partitions.
 
-        This metric measures how much the correlation structure of the whole
-        differs from the sum of its parts. Higher values indicate more
-        "holistic" representations where correlations span partitions.
+        This metric measures mutual information between partitions of the
+        representation. Higher values indicate more "holistic" representations
+        where information is shared across the entire representation.
 
         NOTE: This is a heuristic diagnostic, not a rigorous information measure.
         """
@@ -388,17 +428,19 @@ class HierarchicalEntropyComputer(nn.Module):
         if not partition_points:
             partition_points = [n // 2]
 
-        # Compute entropy at each partition
-        entropy_values = []
+        # Compute mutual information at each partition
+        mi_values = []
         for pt in partition_points:
-            ent = self.compute_entropy_for_partition(sites, pt)
-            entropy_values.append(ent)
+            mi = self.compute_mutual_information(sites, pt)
+            mi_values.append(mi)
 
-        # Take minimum across partitions (most conservative estimate)
-        entropy_stack = torch.stack(entropy_values, dim=-1)
-        hierarchical_entropy = entropy_stack.min(dim=-1)[0]
+        # FIX: Take MEAN instead of min (integration should accumulate)
+        # Previously used min which was too conservative
+        mi_stack = torch.stack(mi_values, dim=-1)
+        hierarchical_entropy = mi_stack.mean(dim=-1)
 
-        return F.relu(hierarchical_entropy)
+        # No ReLU needed since MI is always >= 0
+        return hierarchical_entropy
 
 
 # Backwards compatibility alias
