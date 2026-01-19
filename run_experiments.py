@@ -124,6 +124,7 @@ def run_single_experiment(
             "--config", temp_config,
             "--encoder", encoder,
             "--epochs", str(epochs),
+            "--output_dir", output_dir,
         ]
 
         if sparse_rewards:

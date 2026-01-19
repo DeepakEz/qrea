@@ -23,6 +23,7 @@ Usage:
     python mera_ppo_warehouse.py --robots 16    # Scaling study
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -879,7 +880,8 @@ class MERAWarehousePPO:
     """PPO trainer using existing WarehouseEnv and MERA integration"""
 
     def __init__(self, config_path: str = "config.yaml", encoder_type: str = "mera",
-                 num_epochs: int = 100, device: str = None, config_override: dict = None):
+                 num_epochs: int = 100, device: str = None, config_override: dict = None,
+                 output_dir: str = None):
         # Load config (or use override)
         if config_override is not None:
             self.config = config_override
@@ -969,8 +971,11 @@ class MERAWarehousePPO:
         # Trajectory recording for holographic training (Cosmic Egg, Genome Distillation)
         self.trajectory_recorder = TrajectoryRecorder(capacity=50000, record_every=1)
 
-        # Output
-        self.output_dir = Path(f"./results_{encoder_type}")
+        # Output - use provided output_dir or default
+        if output_dir is not None:
+            self.output_dir = Path(output_dir)
+        else:
+            self.output_dir = Path(f"./results_{encoder_type}")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"  Environment: max_steps={self.env.max_steps}, robots={self.num_robots}")
@@ -1582,6 +1587,8 @@ def main():
                         help='Random seed for reproducibility')
     parser.add_argument('--sparse_rewards', action='store_true',
                         help='Use sparse rewards (delivery only, no shaping)')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Output directory for results (default: results_{encoder})')
     parser.add_argument('--quick_test', action='store_true')
     args = parser.parse_args()
 
@@ -1616,6 +1623,7 @@ def main():
         encoder_type=args.encoder,
         num_epochs=epochs,
         config_override=config_override,
+        output_dir=args.output_dir,
     )
 
     results = trainer.train()
